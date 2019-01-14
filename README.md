@@ -10,7 +10,7 @@ Customisable through a series of macros that change the behaviour of the schedul
 
 # Installation
 Simply include the yatm.hpp in your project. Before using it, certain #defines must be set, the most important ones being:
-* Platform: currently either YATM_STD_THREAD or YATM_WIN64)
+* Platform: currently either YATM_STD_THREAD or YATM_WIN64
 * YATM_DEBUG: 1 for builds that can assert, 0 otherwise 
 
 ## Example usage 1
