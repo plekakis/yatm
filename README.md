@@ -153,7 +153,7 @@ sch.wait(parent);
 **For a more complex example, please look into Source/yatm_sample.cpp**
 
 # Bugs/Requests
-Please use the GitHub issue tracker to submit bugs or request features.
+Please use the [GitHub issue tracker](https://github.com/alkisbkn/yatm/issues) to submit bugs or request features.
 
 # License
 Copyright Pantelis Lekakis, 2019
