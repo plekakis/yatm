@@ -478,11 +478,11 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	struct scheduler_desc
 	{
-		uint32_t	m_numThreads;
-		uint32_t	m_stackSizeInBytes = YATM_DEFAULT_STACK_SIZE;
-		uint32_t	m_jobScratchBufferInBytes = YATM_DEFAULT_JOB_SCRATCH_BUFFER_SIZE;
-		uint32_t	m_jobQueueReservation = YATM_DEFAULT_JOB_QUEUE_RESERVATION;
-		uint32_t	m_pendingJobQueueReservation = YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION;
+		uint32_t	m_numThreads;																		// How many threads to use
+		uint32_t	m_stackSizeInBytes = YATM_DEFAULT_STACK_SIZE;										// Stack size in bytes of each thread (unsupported in YATM_STD_THREAD)
+		uint32_t	m_jobScratchBufferInBytes = YATM_DEFAULT_JOB_SCRATCH_BUFFER_SIZE;					// Size in bytes of the internal scratch allocator. This is used to allocate jobs and job data.
+		uint32_t	m_jobQueueReservation = YATM_DEFAULT_JOB_QUEUE_RESERVATION;							// How many jobs to reserve in the job vector.
+		uint32_t	m_pendingJobQueueReservation = YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION;			// How many jobs to reserve in the pending job vector (jobs waiting to be kicked).
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -582,13 +582,6 @@ namespace yatm
 			delete m_scratch;
 			m_scratch = nullptr;
 
-			// free any remaining jobs (this can happen if m_isRunning is explicitely set to false, while jobs are still available)
-			for (auto& j : m_jobQueue)
-			{
-				if (j != nullptr)
-					delete j;
-				j = nullptr;
-			}
 			m_jobQueue.clear();
 		}
 
@@ -733,6 +726,10 @@ namespace yatm
 
 				for (auto& job : m_pendingJobsToAdd)
 				{
+					// Verify that the job and its data is allocated from scratch buffer.
+					YATM_ASSERT(m_scratch->is_from(job));
+					YATM_ASSERT(job->m_data ? m_scratch->is_from(job->m_data) : true);
+
 					add_job(job);
 				}
 				m_pendingJobsToAdd.clear();
@@ -949,6 +946,15 @@ namespace yatm
 #endif // YATM_DEBUG
 
 				return mem;
+			}
+
+			// -----------------------------------------------------------------------------------------------
+			// Checks if the input pointer is within the scratch allocator's memory boundaries.
+			// -----------------------------------------------------------------------------------------------
+			bool is_from(void* _ptr)
+			{
+				const uint8_t* ptr = reinterpret_cast<const uint8_t*>(_ptr);
+				return (ptr >= m_begin && ptr < m_end);
 			}
 
 		private:
