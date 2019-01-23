@@ -149,8 +149,28 @@ sch.kick();
 // Simply waiting for the parent task to finish executing. A counter would also be valid.
 sch.wait(parent);
 ```
+## Example usage 4
+This example shows how to use the parallel for feature of yatm. It launches N jobs to work on a collection in parallel and blocks the calling thread until all the jobs are done.
+```cpp
+yatm::scheduler sch;
 
-**For a more complex example, please look into Source/yatm_sample.cpp**
+// Initialise the scheduler
+yatm::scheduler_desc desc;
+desc.m_numThreads = sch.get_max_threads() - 1u;
+
+sch.init(desc);
+
+// Creates as many tasks as the length of specified data, kicks them and blocks the caller thread until they are finished.
+sch.parallel_for(my_array.begin(), my_array.end(), [](void* const param)
+{
+  my_struct const& data = *(my_struct*)param;
+
+  // do some intensive work with the data
+  work(data);
+});
+```
+
+**For more complex examples, please look into Source/yatm_sample.cpp**
 
 # Bugs/Requests
 Please use the [GitHub issue tracker](https://github.com/alkisbkn/yatm/issues) to submit bugs or request features.
