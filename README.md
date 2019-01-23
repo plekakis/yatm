@@ -151,7 +151,7 @@ sch.wait(parent);
 ```
 ## Example usage 4
 This example shows how to use the parallel for feature of yatm. It launches N jobs to work on a collection in parallel and blocks the calling thread until all the jobs are done.
-```
+```cpp
 yatm::scheduler sch;
 
 // Initialise the scheduler
