@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cassert>
+#include <functional>
 
 #ifndef YATM_CACHE_LINE_SIZE
 	#define YATM_CACHE_LINE_SIZE (64u)
@@ -71,6 +72,15 @@
 namespace yatm
 {
 	static_assert(sizeof(void*) == 8, "Only 64bit platforms are currently supported");
+
+	// -----------------------------------------------------------------------------------------------
+	// std::bind wrapped, used specifically for the job callbacks.
+	// -----------------------------------------------------------------------------------------------
+	template<typename Fx, typename... Args>
+	static auto bind(Fx&& _function, Args&&... _args)
+	{
+		return std::bind(std::forward<Fx>(_function), std::forward<Args>(_args)..., std::placeholders::_1);
+	}
 
 	// -----------------------------------------------------------------------------------------------
 	// Align input to the next specified alignment.
@@ -369,7 +379,7 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	struct alignas(YATM_CACHE_LINE_SIZE) job
 	{
-		typedef void(*JobFuncPtr)(void* const);
+		using JobFuncPtr = std::function<void(void* const)>;
 				
 		JobFuncPtr			m_function;
 		void*				m_data;
@@ -492,6 +502,59 @@ namespace yatm
 	{
 	private:
 		// -----------------------------------------------------------------------------------------------
+		// Worker internal
+		// -----------------------------------------------------------------------------------------------
+		void worker_internal(scoped_lock<mutex>& _lock)
+		{
+			// Find the next job ready to be processed
+			// This is to keep this worker busy in case many dependencies are processed by other workers.
+			job* current_job = nullptr;
+
+			for (uint32_t i = 0; i < m_jobQueue.size(); ++i)
+			{
+				job* j = m_jobQueue[i];
+				// This job has 1 remaining task, which means that all its dependencies have been processed.
+				// Pick this task, removing it from the job queue.
+				if (j->m_pendingJobs.is_equal(1u))
+				{
+					current_job = j;
+					m_jobQueue.erase(m_jobQueue.begin() + i);
+
+					break;
+				}
+			}
+
+			if (current_job != nullptr)
+			{
+				// We found a job; since we are done with messing with the queue, unlock the mutex
+				_lock.unlock();
+
+				// process job
+				if (current_job->m_function != nullptr)
+				{
+					current_job->m_function(current_job->m_data);
+				}
+
+				// decrement the counter
+				if (current_job->m_counter != nullptr)
+				{
+					current_job->m_counter->decrement();
+				}
+
+				// Lock the mutex again here, to prepare for access in the queue in the next worker iteration.
+				_lock.lock();
+
+				// Finish job, notifying parents recursively.
+				finish_job(current_job);
+			}
+			else
+			{
+				// No jobs, simply yield.
+				yield();
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Worker entry point; pulls jobs from the global queue and processes them.
 		// -----------------------------------------------------------------------------------------------
 		uint32_t worker_entry_point()
@@ -502,52 +565,7 @@ namespace yatm
 				scoped_lock<mutex> lock(&m_queueMutex);
 				m_queueConditionVar.wait(lock, [this] { return !is_paused() && ((m_jobQueue.size() > 0u) || !is_running()); });
 				
-				// Find the next job ready to be processed
-				// This is to keep this worker busy in case many dependencies are processed by other workers.
-				job* current_job = nullptr;
-				
-				for (uint32_t i = 0; i < m_jobQueue.size(); ++i)
-				{
-					job* j = m_jobQueue[i];
-					// This job has 1 remaining task, which means that all its dependencies have been processed.
-					// Pick this task, removing it from the job queue.
-					if (j->m_pendingJobs.is_equal(1u))
-					{
-						current_job = j;
-						m_jobQueue.erase(m_jobQueue.begin() + i);
-						
-						break;
-					}
-				}
-				
-				if (current_job != nullptr)
-				{
-					// We found a job; since we are done with messing with the queue, unlock the mutex
-					lock.unlock();
-
-					// process job
-					if (current_job->m_function != nullptr)
-					{
-						current_job->m_function(current_job->m_data);
-					}
-
-					// decrement the counter
-					if (current_job->m_counter != nullptr)
-					{
-						current_job->m_counter->decrement();
-					}
-
-					// Lock the mutex again here, to prepare for access in the queue in the next worker iteration.
-					lock.lock();
-
-					// Finish job, notifying parents recursively.
-					finish_job(current_job);
-				}
-				else
-				{
-					// No jobs, simply yield.
-					yield();
-				}
+				worker_internal(lock);
 			}
 
 			return 0u;
@@ -571,6 +589,8 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		virtual ~scheduler()
 		{
+			set_running(false);
+
 			// wait for workers to finish
 			join();
 
@@ -712,6 +732,35 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Creates a parallel for loop for the specified collection, launching _function per iteration.
+		// Blocks until all are complete.
+		// -----------------------------------------------------------------------------------------------
+		template<typename Iterator, typename Function>
+		void parallel_for(const Iterator& _begin, const Iterator& _end, const Function& _function)
+		{
+			const size_t n = std::distance(_begin, _end);
+			if (n > 0)
+			{
+				// When there is only 1 job, don't pass it through the scheduler.
+				if (n == 1)
+				{
+					_function(&(*(_begin)));
+				}
+				else
+				{
+					counter jobs_done;
+					for (uint32_t i = 0; i < n; ++i)
+					{
+						job* j = create_job(_function, &(*(_begin + i)), &jobs_done);
+					}
+
+					kick();
+					wait(&jobs_done);
+				}
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Signal the worker threads that work has been added.
 		// -----------------------------------------------------------------------------------------------
 		void kick()
@@ -728,7 +777,6 @@ namespace yatm
 				{
 					// Verify that the job and its data is allocated from scratch buffer.
 					YATM_ASSERT(m_scratch->is_from(job));
-					YATM_ASSERT(job->m_data ? m_scratch->is_from(job->m_data) : true);
 
 					add_job(job);
 				}
@@ -739,26 +787,30 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Wait for a single job to complete.
+		// Wait for a single job to complete. In the meantime, try to process one pending job.
 		// -----------------------------------------------------------------------------------------------
 		void wait(job* const _job)
 		{
 			YATM_ASSERT(_job != nullptr);
 			while (!_job->m_pendingJobs.is_done())
-			{
-				yield();
+			{				
+				// Process jobs while waiting
+				scoped_lock<mutex> lock(&m_queueMutex);
+				worker_internal(lock);
 			}
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Wait for a counter to reach 0.
+		// Wait for a counter to reach 0. In the meantime, try to process one pending job.
 		// -----------------------------------------------------------------------------------------------
 		void wait(counter* const _counter)
 		{
 			YATM_ASSERT(_counter != nullptr);
 			while (!_counter->is_done())
 			{
-				yield();
+				// Process jobs while waiting
+				scoped_lock<mutex> lock(&m_queueMutex);
+				worker_internal(lock);
 			}
 		}
 
@@ -884,7 +936,7 @@ namespace yatm
 				}
 			}
 		}
-
+		
 		// -----------------------------------------------------------------------------------------------
 		// A scratch allocator to handle data and job allocations.
 		// -----------------------------------------------------------------------------------------------
