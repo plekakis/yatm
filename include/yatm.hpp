@@ -42,6 +42,10 @@
 	#define YATM_DEFAULT_JOB_SCRATCH_BUFFER_SIZE (128u * 1024u)
 #endif // YATM_DEFAULT_STACK_SIZE
 
+#ifndef YATM_MAX_WORKER_MASK_STACK_DEPTH
+	#define YATM_MAX_WORKER_MASK_STACK_DEPTH (64u)
+#endif YATM_MAX_WORKER_MASK_STACK_DEPTH // YATM_MAX_WORKER_MASK_STACK_DEPTH
+
 #ifndef YATM_ASSERT
 	#define YATM_ASSERT(x) assert((x))
 #endif // YATM_ASSERT
@@ -66,8 +70,14 @@
 #endif // YATM_WIN64
 
 // Some defaults for reserving space in the job queues
-#define YATM_DEFAULT_JOB_QUEUE_RESERVATION (1024u)
-#define YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION (128u)
+
+#ifndef YATM_DEFAULT_JOB_QUEUE_RESERVATION
+	#define YATM_DEFAULT_JOB_QUEUE_RESERVATION (1024u)
+#endif // YATM_DEFAULT_JOB_QUEUE_RESERVATION
+
+#ifndef YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION
+	#define YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION (128u)
+#endif // YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION
 
 namespace yatm
 {
@@ -380,11 +390,12 @@ namespace yatm
 	struct alignas(YATM_CACHE_LINE_SIZE) job
 	{
 		using JobFuncPtr = std::function<void(void* const)>;
-				
+		
 		JobFuncPtr			m_function;
 		void*				m_data;
 		counter*			m_counter;
-		job*				m_parent;		
+		job*				m_parent;
+		uint32_t			m_workerMask;
 		counter				m_pendingJobs;
 	};
 
@@ -488,8 +499,9 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	struct scheduler_desc
 	{
-		uint32_t	m_numThreads;																		// How many threads to use
-		uint32_t	m_stackSizeInBytes = YATM_DEFAULT_STACK_SIZE;										// Stack size in bytes of each thread (unsupported in YATM_STD_THREAD)
+		uint32_t*	m_threadIds;																		// Thread IDs, used to bind jobs to group of threads. Size must match m_numThreads and is initialised to defaults if not specified.
+		uint32_t	m_numThreads;																		// How many threads to use.		
+		uint32_t	m_stackSizeInBytes = YATM_DEFAULT_STACK_SIZE;										// Stack size in bytes of each thread (unsupported in YATM_STD_THREAD).
 		uint32_t	m_jobScratchBufferInBytes = YATM_DEFAULT_JOB_SCRATCH_BUFFER_SIZE;					// Size in bytes of the internal scratch allocator. This is used to allocate jobs and job data.
 		uint32_t	m_jobQueueReservation = YATM_DEFAULT_JOB_QUEUE_RESERVATION;							// How many jobs to reserve in the job vector.
 		uint32_t	m_pendingJobQueueReservation = YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION;			// How many jobs to reserve in the pending job vector (jobs waiting to be kicked).
@@ -502,9 +514,18 @@ namespace yatm
 	{
 	private:
 		// -----------------------------------------------------------------------------------------------
+		// Used to pass in data when the workers are initialised.
+		// -----------------------------------------------------------------------------------------------
+		struct worker_thread_data
+		{
+			yatm::scheduler*	m_scheduler;
+			uint32_t			m_id;
+		};
+
+		// -----------------------------------------------------------------------------------------------
 		// Worker internal
 		// -----------------------------------------------------------------------------------------------
-		void worker_internal(scoped_lock<mutex>& _lock)
+		bool worker_internal(scoped_lock<mutex>& _lock, uint32_t _index)
 		{
 			// Find the next job ready to be processed
 			// This is to keep this worker busy in case many dependencies are processed by other workers.
@@ -513,14 +534,18 @@ namespace yatm
 			for (uint32_t i = 0; i < m_jobQueue.size(); ++i)
 			{
 				job* j = m_jobQueue[i];
-				// This job has 1 remaining task, which means that all its dependencies have been processed.
-				// Pick this task, removing it from the job queue.
-				if (j->m_pendingJobs.is_equal(1u))
+				// Can this job be processed by this worker thread?
+				if (j->m_workerMask & (1u << _index))
 				{
-					current_job = j;
-					m_jobQueue.erase(m_jobQueue.begin() + i);
+					// This job has 1 remaining task, which means that all its dependencies have been processed.
+					// Pick this task, removing it from the job queue.
+					if (j->m_pendingJobs.is_equal(1u))
+					{
+						current_job = j;
+						m_jobQueue.erase(m_jobQueue.begin() + i);
 
-					break;
+						break;
+					}
 				}
 			}
 
@@ -541,23 +566,25 @@ namespace yatm
 					current_job->m_counter->decrement();
 				}
 
-				// Lock the mutex again here, to prepare for access in the queue in the next worker iteration.
-				_lock.lock();
-
 				// Finish job, notifying parents recursively.
 				finish_job(current_job);
+
+				// Lock the mutex again here, to prepare for access in the queue in the next worker iteration.
+				_lock.lock();
 			}
 			else
 			{
 				// No jobs, simply yield.
 				yield();
 			}
+
+			return (current_job != nullptr);
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Worker entry point; pulls jobs from the global queue and processes them.
 		// -----------------------------------------------------------------------------------------------
-		uint32_t worker_entry_point()
+		uint32_t worker_entry_point(uint32_t _index)
 		{
 			while (m_isRunning)
 			{
@@ -565,7 +592,7 @@ namespace yatm
 				scoped_lock<mutex> lock(&m_queueMutex);
 				m_queueConditionVar.wait(lock, [this] { return !is_paused() && ((m_jobQueue.size() > 0u) || !is_running()); });
 				
-				worker_internal(lock);
+				worker_internal(lock, _index);
 			}
 
 			return 0u;
@@ -574,8 +601,10 @@ namespace yatm
 	public:
 		// -----------------------------------------------------------------------------------------------
 		scheduler() :
-			m_threads(nullptr), m_scratch(nullptr)
+			m_threads(nullptr), m_scratch(nullptr), m_currentWorkerMaskDepth(0u)
 		{ 
+			memset(m_currentWorkerMasks, ~0u, sizeof(uint32_t) * YATM_MAX_WORKER_MASK_STACK_DEPTH);
+
 #if YATM_STD_THREAD
 			m_hwConcurency = std::thread::hardware_concurrency();
 #elif YATM_WIN64
@@ -593,6 +622,10 @@ namespace yatm
 
 			// wait for workers to finish
 			join();
+			
+			// free thread data array
+			delete[] m_threadData;
+			m_threadData = nullptr;
 
 			// free the thread array
 			delete[] m_threads;
@@ -614,7 +647,17 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void init(const scheduler_desc& _desc)
 		{
-			m_numThreads = std::max(1u, std::min<uint32_t>(_desc.m_numThreads, m_hwConcurency));
+			m_numThreads = std::max(1u, std::min<uint32_t>(_desc.m_numThreads, get_max_threads()));
+			
+			m_threadData = new worker_thread_data[m_numThreads];						
+			for (uint32_t i = 0; i < m_numThreads; ++i)
+			{
+				m_threadData[i].m_scheduler = this;
+
+				// Optinally copy custom worker ids (these will be used bitmasks when picking a worker for each job).
+				m_threadData[i].m_id = (_desc.m_threadIds == nullptr) ? i : _desc.m_threadIds[i];
+			}
+
 #if YATM_STD_THREAD
 			YATM_TTY("yatm is using std::thread, configurable stack size is not allowed");
 #endif // YATM_STD_THREAD
@@ -640,11 +683,11 @@ namespace yatm
 			{
 				auto func = [](void* data) -> uint32_t
 				{
-					yatm::scheduler* sch = reinterpret_cast<yatm::scheduler*>(data);
-					return sch->worker_entry_point();
+					worker_thread_data* d = reinterpret_cast<worker_thread_data*>(data);
+					return d->m_scheduler->worker_entry_point(d->m_id);
 				};
 
-				m_threads[i].create(i, m_stackSizeInBytes, func, this);
+				m_threads[i].create(i, m_stackSizeInBytes, func, &m_threadData[i]);
 			}
 		}
 
@@ -655,6 +698,24 @@ namespace yatm
 		{
 			YATM_ASSERT(m_scratch != nullptr);
 			m_scratch->reset();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Push a new worker mask depth, subsequent job allocations will be set to run on the specified workers.
+		// -----------------------------------------------------------------------------------------------
+		void push_worker_mask(uint32_t _workerMask)
+		{
+			YATM_ASSERT(m_currentWorkerMaskDepth < YATM_MAX_WORKER_MASK_STACK_DEPTH);
+			m_currentWorkerMasks[++m_currentWorkerMaskDepth] = _workerMask;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Pop worker mask depth.
+		// -----------------------------------------------------------------------------------------------
+		void pop_worker_mask()
+		{
+			YATM_ASSERT(m_currentWorkerMaskDepth > 0);
+			--m_currentWorkerMaskDepth;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -669,6 +730,7 @@ namespace yatm
 			j->m_data = _data;
 			j->m_parent = nullptr;
 			j->m_counter = _counter;
+			j->m_workerMask = m_currentWorkerMasks[m_currentWorkerMaskDepth];
 
 			// Initialise the job with 1 pending job (itself).
 			// Adding dependencies increments the pending counter, resolving dependencies decrements it.
@@ -787,16 +849,34 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Try to process the job on a compatible worker thread.
+		// -----------------------------------------------------------------------------------------------
+		void process_single_job()
+		{
+			scoped_lock<mutex> lock(&m_queueMutex);
+			if (m_jobQueue.size() > 0)
+			{
+				// Find the worker able to process this job.
+				for (uint32_t i = 0; i < m_numThreads; ++i)
+				{
+					const uint32_t id = m_threadData[i].m_id;
+					if (worker_internal(lock, id))
+					{
+						return;
+					}
+				}								
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Wait for a single job to complete. In the meantime, try to process one pending job.
 		// -----------------------------------------------------------------------------------------------
 		void wait(job* const _job)
 		{
 			YATM_ASSERT(_job != nullptr);
 			while (!_job->m_pendingJobs.is_done())
-			{				
-				// Process jobs while waiting
-				scoped_lock<mutex> lock(&m_queueMutex);
-				worker_internal(lock);
+			{
+				process_single_job();
 			}
 		}
 
@@ -809,8 +889,7 @@ namespace yatm
 			while (!_counter->is_done())
 			{
 				// Process jobs while waiting
-				scoped_lock<mutex> lock(&m_queueMutex);
-				worker_internal(lock);
+				process_single_job();
 			}
 		}
 
@@ -889,7 +968,10 @@ namespace yatm
 		mutex					m_pendingJobsMutex;
 		size_t					m_stackSizeInBytes;
 		uint32_t				m_hwConcurency;
+		uint32_t				m_currentWorkerMasks[YATM_MAX_WORKER_MASK_STACK_DEPTH];
+		uint32_t				m_currentWorkerMaskDepth;
 		uint32_t				m_numThreads;
+		worker_thread_data*		m_threadData;
 		bool					m_isRunning;
 		bool					m_isPaused;
 		thread*					m_threads;
