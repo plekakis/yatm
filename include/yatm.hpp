@@ -404,7 +404,7 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	class thread
 	{
-		typedef uint32_t(*ThreadEntryPoint)(void*);
+		typedef void(*ThreadEntryPoint)(void*);
 	public:
 		// -----------------------------------------------------------------------------------------------
 		thread()
@@ -584,7 +584,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Worker entry point; pulls jobs from the global queue and processes them.
 		// -----------------------------------------------------------------------------------------------
-		uint32_t worker_entry_point(uint32_t _index)
+		void worker_entry_point(uint32_t _index)
 		{
 			while (m_isRunning)
 			{
@@ -594,8 +594,6 @@ namespace yatm
 				
 				worker_internal(lock, _index);
 			}
-
-			return 0u;
 		}
 
 	public:
@@ -681,10 +679,10 @@ namespace yatm
 			// Each worker will process the next available job item from the global queue, resolve its dependencies and carry on until no jobs are left.
 			for (uint32_t i = 0; i < m_numThreads; ++i)
 			{
-				auto func = [](void* data) -> uint32_t
+				auto func = [](void* data) -> void
 				{
 					worker_thread_data* d = reinterpret_cast<worker_thread_data*>(data);
-					return d->m_scheduler->worker_entry_point(d->m_id);
+					d->m_scheduler->worker_entry_point(d->m_id);
 				};
 
 				m_threads[i].create(i, m_stackSizeInBytes, func, &m_threadData[i]);
