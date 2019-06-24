@@ -99,7 +99,7 @@ sch.wait(&counter);
 sch.reset();
 ```
 ## Example usage 3
-This example illustrates parent-child relationships by setting up a dependency between 2 child tasks and 1 parent. The children finish first, then the parent.
+This example illustrates parent-child relationships by setting up a dependency between 10 child tasks and 1 parent. The children finish first, then the parent.
 ```cpp
 yatm::scheduler sch;
 
