@@ -3,14 +3,14 @@ A simple to use threaded task manager, supporting either std::thread or native t
 Customisable through a series of macros that change the behaviour of the scheduler:
 * YATM_STD_THREAD
 * YATM_WIN64
-* YATM_NIX
+* YATM_LINUX
 * YATM_DEBUG
 * YATM_TTY
 * and more
 
 # Installation
 Simply include the yatm.hpp in your project. Before using it, certain #defines must be set, the most important ones being:
-* Platform: currently either YATM_STD_THREAD or YATM_WIN64
+* Platform: currently either YATM_STD_THREAD, YATM_WIN64 or YATM_LINUX.
 * YATM_DEBUG: 1 for builds that can assert, 0 otherwise 
 
 ## Example usage 1
