@@ -1,18 +1,18 @@
 /*
 ** MIT License
-** 
+**
 ** Copyright(c) 2019, Pantelis Lekakis
-** 
+**
 ** Permission is hereby granted, free of charge, to any person obtaining a copy
 ** of this software and associated documentation files(the "Software"), to deal
 ** in the Software without restriction, including without limitation the rights
 ** to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 ** copies of the Software, and to permit persons to whom the Software is
 ** furnished to do so, subject to the following conditions :
-** 
+**
 ** The above copyright notice and this permission notice shall be included in all
 ** copies or substantial portions of the Software.
-** 
+**
 ** THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 ** IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 ** FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
@@ -29,6 +29,8 @@
 #include <cstdlib>
 #include <cassert>
 #include <functional>
+#include <limits.h>
+#include <memory.h>
 
 #ifndef YATM_CACHE_LINE_SIZE
 	#define YATM_CACHE_LINE_SIZE (64u)
@@ -44,7 +46,7 @@
 
 #ifndef YATM_MAX_WORKER_MASK_STACK_DEPTH
 	#define YATM_MAX_WORKER_MASK_STACK_DEPTH (64u)
-#endif YATM_MAX_WORKER_MASK_STACK_DEPTH // YATM_MAX_WORKER_MASK_STACK_DEPTH
+#endif // YATM_MAX_WORKER_MASK_STACK_DEPTH
 
 #ifndef YATM_ASSERT
 	#define YATM_ASSERT(x) assert((x))
@@ -55,13 +57,23 @@
 #endif // YATM_TTY
 
 #ifndef YATM_DEBUG
-	#define YATM_DEBUG (0u)
+	#ifdef _MSC_VER
+		#define YATM_DEBUG (_DEBUG)
+	#endif //_MSC_VER
 #endif // YATM_DEBUG
+
+// When STD_THREAD is defined, undef platform_specific.
+#if YATM_STD_THREAD
+#undef YATM_WIN64
+#undef YATM_LINUX
+#endif // YATM_STD_THREAD
 
 #if YATM_WIN64
 	#define NOMINMAX
 	#define WIN32_LEAN_AND_MEAN
 	#include <Windows.h>
+#elif YATM_LINUX
+
 #elif YATM_STD_THREAD
 	#include <thread>
 	#include <condition_variable>
@@ -241,7 +253,7 @@ namespace yatm
 		~condition_var()
 		{
 #if YATM_WIN64
-			
+
 #endif // YATM_WIN64
 		}
 
@@ -323,6 +335,8 @@ namespace yatm
 			return m_value.compare_exchange_strong(expected, get_current());
 #elif YATM_WIN64
 			return m_value == expected;
+#elif YATM_LINUX
+		  return m_value == expected;
 #endif // YATM_STD_THREAD
 		}
 
@@ -335,6 +349,8 @@ namespace yatm
 			return m_value.compare_exchange_strong(_value, get_current());
 #elif YATM_WIN64
 			return _value == m_value;
+#elif YATM_LINUX
+		  return _value == m_value;
 #endif // YATM_STD_THREAD
 		}
 
@@ -344,10 +360,12 @@ namespace yatm
 		uint32_t increment()
 		{
 			YATM_ASSERT(get_current() < UINT_MAX);
-#if YATM_STD_THREAD			
+#if YATM_STD_THREAD
 			return ++m_value;
 #elif YATM_WIN64
 			return InterlockedIncrement(&m_value);
+#elif YATM_LINUX
+		  return 0;
 #endif // YATM_STD_THREAD
 		}
 
@@ -357,10 +375,12 @@ namespace yatm
 		uint32_t decrement()
 		{
 			YATM_ASSERT(get_current() != 0);
-#if YATM_STD_THREAD			
+#if YATM_STD_THREAD
 			return --m_value;
 #elif YATM_WIN64
 			return InterlockedDecrement(&m_value);
+#elif YATM_LINUX
+			return 0;
 #endif // YATM_STD_THREAD
 		}
 
@@ -373,6 +393,8 @@ namespace yatm
 			return m_value.load();
 #elif YATM_WIN64
 			return m_value;
+#elif YATM_LINUX
+			return 0;
 #endif // YATM_STD_THREAD
 		}
 
@@ -381,16 +403,18 @@ namespace yatm
 		std::atomic_uint32_t m_value;
 #elif YATM_WIN64
 		LONG m_value;
+#elif YATM_LINUX
+		uint32_t m_value;
 #endif // YATM_STD_THREAD
 	};
-	
+
 	// -----------------------------------------------------------------------------------------------
 	// Describes a job that the scheduler can run.
 	// -----------------------------------------------------------------------------------------------
 	struct alignas(YATM_CACHE_LINE_SIZE) job
 	{
 		using JobFuncPtr = std::function<void(void* const)>;
-		
+
 		JobFuncPtr			m_function;
 		void*				m_data;
 		counter*			m_counter;
@@ -442,7 +466,7 @@ namespace yatm
 
 #if YATM_STD_THREAD
 			m_thread = std::thread(_function, _data);
-#elif YATM_WIN64			
+#elif YATM_WIN64
 			m_handle = CreateThread(nullptr, m_stackSizeInBytes, (LPTHREAD_START_ROUTINE)_function, _data, 0, &m_threadId);
 			YATM_ASSERT(m_handle != nullptr);
 #endif // YATM_STD_THREAD
@@ -477,8 +501,9 @@ namespace yatm
 			DWORD h = GetThreadId(m_handle);
 			YATM_ASSERT(h == m_threadId);
 	#endif // YATM_DEBUG
-
 			return (size_t)m_threadId;
+#elif YATM_LINUX
+			return 0;
 #endif // YATM_STD_THREAD
 		}
 
@@ -488,10 +513,13 @@ namespace yatm
 #elif YATM_WIN64
 		HANDLE		m_handle;
 		DWORD		m_threadId;
+#elif YATM_LINUX
+		uint32_t m_handle;
+		uint32_t m_threadId;
 #endif // YATM_STD_THREAD
 
 		size_t		m_stackSizeInBytes;
-		uint32_t	m_index;		
+		uint32_t	m_index;
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -500,7 +528,7 @@ namespace yatm
 	struct scheduler_desc
 	{
 		uint32_t*	m_threadIds;																		// Thread IDs, used to bind jobs to group of threads. Size must match m_numThreads and is initialised to defaults if not specified.
-		uint32_t	m_numThreads;																		// How many threads to use.		
+		uint32_t	m_numThreads;																		// How many threads to use.
 		uint32_t	m_stackSizeInBytes = YATM_DEFAULT_STACK_SIZE;										// Stack size in bytes of each thread (unsupported in YATM_STD_THREAD).
 		uint32_t	m_jobScratchBufferInBytes = YATM_DEFAULT_JOB_SCRATCH_BUFFER_SIZE;					// Size in bytes of the internal scratch allocator. This is used to allocate jobs and job data.
 		uint32_t	m_jobQueueReservation = YATM_DEFAULT_JOB_QUEUE_RESERVATION;							// How many jobs to reserve in the job vector.
@@ -591,7 +619,7 @@ namespace yatm
 				// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
 				scoped_lock<mutex> lock(&m_queueMutex);
 				m_queueConditionVar.wait(lock, [this] { return !is_paused() && ((m_jobQueue.size() > 0u) || !is_running()); });
-				
+
 				worker_internal(lock, _index);
 			}
 		}
@@ -600,8 +628,8 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		scheduler() :
 			m_threads(nullptr), m_scratch(nullptr), m_currentWorkerMaskDepth(0u)
-		{ 
-			memset(m_currentWorkerMasks, ~0u, sizeof(uint32_t) * YATM_MAX_WORKER_MASK_STACK_DEPTH);
+		{
+			memset((void*)m_currentWorkerMasks, ~0u, sizeof(uint32_t) * YATM_MAX_WORKER_MASK_STACK_DEPTH);
 
 #if YATM_STD_THREAD
 			m_hwConcurency = std::thread::hardware_concurrency();
@@ -612,7 +640,7 @@ namespace yatm
 			m_hwConcurency = info.dwNumberOfProcessors;
 #endif // YATM_STD_THREAD
 		}
-		
+
 		// -----------------------------------------------------------------------------------------------
 		virtual ~scheduler()
 		{
@@ -620,7 +648,7 @@ namespace yatm
 
 			// wait for workers to finish
 			join();
-			
+
 			// free thread data array
 			delete[] m_threadData;
 			m_threadData = nullptr;
@@ -646,8 +674,8 @@ namespace yatm
 		void init(const scheduler_desc& _desc)
 		{
 			m_numThreads = std::max(1u, std::min<uint32_t>(_desc.m_numThreads, get_max_threads()));
-			
-			m_threadData = new worker_thread_data[m_numThreads];						
+
+			m_threadData = new worker_thread_data[m_numThreads];
 			for (uint32_t i = 0; i < m_numThreads; ++i)
 			{
 				m_threadData[i].m_scheduler = this;
@@ -661,7 +689,7 @@ namespace yatm
 #endif // YATM_STD_THREAD
 
 			m_stackSizeInBytes = align(_desc.m_stackSizeInBytes > 0 ? _desc.m_stackSizeInBytes : YATM_DEFAULT_STACK_SIZE, 16u);
-						
+
 			m_threads = new thread[m_numThreads];
 			m_scratch = new scratch( align(_desc.m_jobScratchBufferInBytes, 16u), 16u);
 
@@ -775,7 +803,7 @@ namespace yatm
 		T* allocate(size_t _alignment = 16u)
 		{
 			uint8_t* mem = m_scratch->alloc(sizeof(T), _alignment);
-			
+
 			T* obj = new(mem) T();
 			return obj;
 		}
@@ -862,7 +890,7 @@ namespace yatm
 					{
 						return;
 					}
-				}								
+				}
 			}
 		}
 
@@ -918,7 +946,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void set_running(bool _running)
 		{
-			m_isRunning = _running; 
+			m_isRunning = _running;
 			m_queueConditionVar.notify_all();
 		}
 
@@ -941,7 +969,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void sleep(uint32_t ms)
 		{
-#if YATM_STD_THREAD			
+#if YATM_STD_THREAD
 			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 #elif YATM_WIN64
 			Sleep(ms);
@@ -1016,7 +1044,7 @@ namespace yatm
 				}
 			}
 		}
-		
+
 		// -----------------------------------------------------------------------------------------------
 		// A scratch allocator to handle data and job allocations.
 		// -----------------------------------------------------------------------------------------------
@@ -1029,8 +1057,6 @@ namespace yatm
 
 			{
 				YATM_ASSERT(is_pow2(m_alignment));
-
-				m_sizeInBytes = m_sizeInBytes;
 
 				m_begin = (uint8_t*)aligned_alloc(m_sizeInBytes, m_alignment);
 				YATM_ASSERT(m_begin != nullptr);
@@ -1125,7 +1151,7 @@ namespace yatm
 				const size_t remainder = ((size_t)buf) % _alignment;
 				const size_t offset = _alignment - remainder;
 				uint8_t* ret = buf + (uint8_t)offset;
-				
+
 				// store how many extra bytes we allocated in the byte just before the pointer we return
 				*(uint8_t*)(ret - 1) = (uint8_t)offset;
 
