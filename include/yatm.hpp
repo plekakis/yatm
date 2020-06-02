@@ -25,6 +25,7 @@
 #pragma once
 
 #include <vector>
+#include <atomic>
 #include <algorithm>
 #include <cstdlib>
 #include <cassert>
@@ -73,13 +74,19 @@
 	#define WIN32_LEAN_AND_MEAN
 	#include <Windows.h>
 #elif YATM_LINUX
-
+	#include <unistd.h>
 #elif YATM_STD_THREAD
 	#include <thread>
 	#include <condition_variable>
 	#include <atomic>
 	#include <chrono>
 #endif // YATM_WIN64
+
+#define YATM_USE_PTHREADS (YATM_LINUX)
+
+#if YATM_USE_PTHREADS
+	#include <pthread.h>
+#endif // YATM_USE_PTHREADS
 
 // Some defaults for reserving space in the job queues
 
@@ -132,6 +139,8 @@ namespace yatm
 		{
 #if YATM_WIN64
 			InitializeCriticalSection(&m_cs);
+#elif YATM_USE_PTHREADS
+			pthread_mutex_init(&m_pmtx, nullptr);
 #endif // YATM_WIN64
 		}
 
@@ -145,6 +154,8 @@ namespace yatm
 
 #if YATM_WIN64
 			DeleteCriticalSection(&m_cs);
+#elif YATM_USE_PTHREADS
+			pthread_mutex_destroy(&m_pmtx);
 #endif // YATM_WIN64
 		}
 
@@ -157,6 +168,9 @@ namespace yatm
 			m_mutex.lock();
 #elif YATM_WIN64
 			EnterCriticalSection(&m_cs);
+#elif YATM_USE_PTHREADS
+			int32_t const errorCode = pthread_mutex_lock(&m_pmtx);
+			YATM_ASSERT(errorCode == 0);
 #endif // YATM_STD_THREAD
 		}
 
@@ -170,6 +184,8 @@ namespace yatm
 			v = m_mutex.try_lock();
 #elif YATM_WIN64
 			v = TryEnterCriticalSection(&m_cs);
+#elif YATM_USE_PTHREADS
+			v = (pthread_mutex_trylock(&m_pmtx) == 0);
 #endif // YATM_STD_THREAD
 
 			return v;
@@ -184,6 +200,9 @@ namespace yatm
 			m_mutex.unlock();
 #elif YATM_WIN64
 			LeaveCriticalSection(&m_cs);
+#elif YATM_USE_PTHREADS
+			int32_t const errorCode = pthread_mutex_lock(&m_pmtx);
+			YATM_ASSERT(errorCode == 0);
 #endif // YATM_STD_THREAD
 		}
 
@@ -192,6 +211,8 @@ namespace yatm
 		std::mutex m_mutex;
 #elif YATM_WIN64
 		CRITICAL_SECTION m_cs;
+#elif YATM_USE_PTHREADS
+		pthread_mutex_t m_pmtx;
 #endif // YATM_STD_THREAD
 	};
 
@@ -270,6 +291,8 @@ namespace yatm
 			m_cv.notify_all();
 #elif YATM_WIN64
 			WakeAllConditionVariable(&m_cv);
+#elif YATM_USE_PTHREADS
+			pthread_cond_broadcast(&m_cv);
 #endif // YATM_STD_THREAD
 		}
 
@@ -282,6 +305,8 @@ namespace yatm
 			m_cv.notify_one();
 #elif YATM_WIN64
 			WakeConditionVariable(&m_cv);
+#elif YATM_USE_PTHREADS
+			pthread_cond_signal(&m_cv);
 #endif // YATM_STD_THREAD
 		}
 
@@ -298,6 +323,11 @@ namespace yatm
 			{
 				SleepConditionVariableCS(&m_cv, &_lock.m_mutex->m_cs, INFINITE);
 			}
+#elif YATM_USE_PTHREADS
+			while (!_condition())
+			{
+					pthread_cond_wait(&m_cv, &_lock.m_mutex->m_pmtx);
+			}
 #endif // YATM_STD_THREAD
 		}
 
@@ -306,6 +336,8 @@ namespace yatm
 		std::condition_variable_any m_cv;
 #elif YATM_WIN64
 		CONDITION_VARIABLE m_cv;
+#elif YATM_USE_PTHREADS
+		pthread_cond_t m_cv;
 #endif // YATM_STD_THREAD
 	};
 
@@ -331,12 +363,10 @@ namespace yatm
 		bool is_done()
 		{
 			uint32_t expected = 0u;
-#if YATM_STD_THREAD
+#if YATM_STD_THREAD || YATM_USE_PTHREADS
 			return m_value.compare_exchange_strong(expected, get_current());
 #elif YATM_WIN64
 			return m_value == expected;
-#elif YATM_LINUX
-		  return m_value == expected;
 #endif // YATM_STD_THREAD
 		}
 
@@ -345,12 +375,10 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		bool is_equal(uint32_t _value)
 		{
-#if YATM_STD_THREAD
+#if YATM_STD_THREAD || YATM_USE_PTHREADS
 			return m_value.compare_exchange_strong(_value, get_current());
 #elif YATM_WIN64
 			return _value == m_value;
-#elif YATM_LINUX
-		  return _value == m_value;
 #endif // YATM_STD_THREAD
 		}
 
@@ -360,12 +388,10 @@ namespace yatm
 		uint32_t increment()
 		{
 			YATM_ASSERT(get_current() < UINT_MAX);
-#if YATM_STD_THREAD
+#if YATM_STD_THREAD || YATM_USE_PTHREADS
 			return ++m_value;
 #elif YATM_WIN64
 			return InterlockedIncrement(&m_value);
-#elif YATM_LINUX
-		  return 0;
 #endif // YATM_STD_THREAD
 		}
 
@@ -375,12 +401,10 @@ namespace yatm
 		uint32_t decrement()
 		{
 			YATM_ASSERT(get_current() != 0);
-#if YATM_STD_THREAD
+#if YATM_STD_THREAD || YATM_USE_PTHREADS
 			return --m_value;
 #elif YATM_WIN64
 			return InterlockedDecrement(&m_value);
-#elif YATM_LINUX
-			return 0;
 #endif // YATM_STD_THREAD
 		}
 
@@ -389,22 +413,18 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		uint32_t get_current() const
 		{
-#if YATM_STD_THREAD
+#if YATM_STD_THREAD || YATM_USE_PTHREADS
 			return m_value.load();
 #elif YATM_WIN64
 			return m_value;
-#elif YATM_LINUX
-			return 0;
 #endif // YATM_STD_THREAD
 		}
 
 	private:
-#if YATM_STD_THREAD
+#if YATM_STD_THREAD || YATM_USE_PTHREADS
 		std::atomic_uint32_t m_value;
 #elif YATM_WIN64
 		LONG m_value;
-#elif YATM_LINUX
-		uint32_t m_value;
 #endif // YATM_STD_THREAD
 	};
 
@@ -450,6 +470,8 @@ namespace yatm
 			{
 				TerminateThread(m_handle, 0u);
 			}
+#elif YATM_USE_PTHREADS
+			pthread_exit(nullptr);
 #endif // YATM_WIN64
 		}
 
@@ -458,7 +480,6 @@ namespace yatm
 		thread& operator=(const thread&) = delete;
 
 		// -----------------------------------------------------------------------------------------------
-		//template<typename T>
 		void create(uint32_t _index, size_t _stackSizeInBytes, ThreadEntryPoint _function, void* const _data)
 		{
 			m_index = _index;
@@ -469,6 +490,9 @@ namespace yatm
 #elif YATM_WIN64
 			m_handle = CreateThread(nullptr, m_stackSizeInBytes, (LPTHREAD_START_ROUTINE)_function, _data, 0, &m_threadId);
 			YATM_ASSERT(m_handle != nullptr);
+#elif YATM_USE_PTHREADS
+			int32_t const errorCode = pthread_create(&m_thread, NULL, (void*(*)(void*))_function, _data);
+			YATM_ASSERT(errorCode == 0);
 #endif // YATM_STD_THREAD
 		}
 
@@ -480,6 +504,8 @@ namespace yatm
 			m_thread.join();
 #elif YATM_WIN64
 			WaitForSingleObject(m_handle, INFINITE);
+#elif YATM_USE_PTHREADS
+			pthread_join(m_thread, nullptr);
 #endif // YATM_STD_THREAD
 		}
 
@@ -503,7 +529,7 @@ namespace yatm
 	#endif // YATM_DEBUG
 			return (size_t)m_threadId;
 #elif YATM_LINUX
-			return 0;
+			return m_threadId;
 #endif // YATM_STD_THREAD
 		}
 
@@ -512,10 +538,10 @@ namespace yatm
 		std::thread m_thread;
 #elif YATM_WIN64
 		HANDLE		m_handle;
-		DWORD		m_threadId;
-#elif YATM_LINUX
-		uint32_t m_handle;
-		uint32_t m_threadId;
+		DWORD		  m_threadId;
+#elif YATM_USE_PTHREADS
+		pthread_t m_thread;
+		uint32_t  m_threadId;
 #endif // YATM_STD_THREAD
 
 		size_t		m_stackSizeInBytes;
@@ -638,6 +664,8 @@ namespace yatm
 			ZeroMemory(&info, sizeof(info));
 			GetSystemInfo(&info);
 			m_hwConcurency = info.dwNumberOfProcessors;
+#elif YATM_LINUX
+			m_hwConcurency = sysconf(_SC_NPROCESSORS_CONF);
 #endif // YATM_STD_THREAD
 		}
 
@@ -928,6 +956,8 @@ namespace yatm
 			std::this_thread::yield();
 #elif YATM_WIN64
 			SwitchToThread();
+#elif YATM_USE_PTHREADS
+			pthread_yield();
 #endif // YATM_STD_THREAD
 		}
 
@@ -973,6 +1003,8 @@ namespace yatm
 			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 #elif YATM_WIN64
 			Sleep(ms);
+#elif YATM_LINUX
+			usleep(ms * 1000);
 #endif // YATM_STD_THREAD
 		}
 
