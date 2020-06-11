@@ -24,10 +24,10 @@
 
 #pragma once
 
+#include <chrono>
+
 namespace yatm
 {
-	#include <chrono>
-
 	// -----------------------------------------------------------------------------------------------
 	class scoped_profiler
 	{

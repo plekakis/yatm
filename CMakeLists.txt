@@ -21,6 +21,6 @@ endif()
 
 target_compile_definitions(SharedSettings INTERFACE ${MACROS})
 target_compile_features(SharedSettings INTERFACE cxx_std_17)
-include_directories(${CMAKE_SOURCE_DIR}/include)
+target_include_directories(SharedSettings INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 add_subdirectory(samples)
