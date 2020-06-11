@@ -454,12 +454,12 @@ namespace yatm
 	{
 		using JobFuncPtr = std::function<void(void* const)>;
 
-		JobFuncPtr		m_function;
-		void*					m_data;
-		counter*			m_counter;
-		job*					m_parent;
-		uint32_t			m_workerMask;
-		counter				m_pendingJobs;
+		JobFuncPtr	m_function;
+		void*		m_data;
+		counter*	m_counter;
+		job*		m_parent;
+		uint32_t	m_workerMask;
+		counter		m_pendingJobs;
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -557,7 +557,7 @@ namespace yatm
 		std::thread m_thread;
 #elif YATM_WIN64
 		HANDLE		m_handle;
-		DWORD		  m_threadId;
+		DWORD		m_threadId;
 #elif YATM_USE_PTHREADS
 		pthread_t m_thread;
 		uint32_t  m_threadId;
@@ -668,6 +668,9 @@ namespace yatm
 					}
 #endif // YATM_ENABLE_WORK_STEALING
 
+					// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
+					m_queueConditionVar.wait(lock, [this, &queue] { return !is_paused() && ((queue.size() > 0u) || !is_running()); });
+
 					// Find the next job ready to be processed
 					for (uint32_t i = 0; i < queue.size(); ++i)
 					{
@@ -685,9 +688,6 @@ namespace yatm
 							}
 						}
 					}
-
-					// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
-					m_queueConditionVar.wait(lock, [this, &queue] { return !is_paused() && ((queue.size() > 0u) || !is_running()); });
 				}
 				worker_internal(queue, _index, current_job);
 			}
