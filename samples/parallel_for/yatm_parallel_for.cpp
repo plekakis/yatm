@@ -21,7 +21,7 @@
 ** OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 ** SOFTWARE.
 */
-#define YATM_STD_THREAD (1u)
+#define YATM_STD_THREAD (0u)
 
 #include "../common/sample.hpp"
 

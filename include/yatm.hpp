@@ -201,7 +201,7 @@ namespace yatm
 #elif YATM_WIN64
 			LeaveCriticalSection(&m_cs);
 #elif YATM_USE_PTHREADS
-			int32_t const errorCode = pthread_mutex_lock(&m_pmtx);
+			int32_t const errorCode = pthread_mutex_unlock(&m_pmtx);
 			YATM_ASSERT(errorCode == 0);
 #endif // YATM_STD_THREAD
 		}
@@ -267,6 +267,8 @@ namespace yatm
 		{
 #if YATM_WIN64
 			InitializeConditionVariable(&m_cv);
+#elif YATM_USE_PTHREADS
+			pthread_cond_init(&m_cv, nullptr);
 #endif // YATM_WIN64
 		}
 
@@ -275,6 +277,8 @@ namespace yatm
 		{
 #if YATM_WIN64
 
+#elif YATM_USE_PTHREADS
+			pthread_cond_destroy(&m_cv);
 #endif // YATM_WIN64
 		}
 
@@ -435,10 +439,10 @@ namespace yatm
 	{
 		using JobFuncPtr = std::function<void(void* const)>;
 
-		JobFuncPtr			m_function;
-		void*				m_data;
+		JobFuncPtr		m_function;
+		void*					m_data;
 		counter*			m_counter;
-		job*				m_parent;
+		job*					m_parent;
 		uint32_t			m_workerMask;
 		counter				m_pendingJobs;
 	};
@@ -491,7 +495,7 @@ namespace yatm
 			m_handle = CreateThread(nullptr, m_stackSizeInBytes, (LPTHREAD_START_ROUTINE)_function, _data, 0, &m_threadId);
 			YATM_ASSERT(m_handle != nullptr);
 #elif YATM_USE_PTHREADS
-			int32_t const errorCode = pthread_create(&m_thread, NULL, (void*(*)(void*))_function, _data);
+			int32_t const errorCode = pthread_create(&m_thread, nullptr, (void*(*)(void*))_function, _data);
 			YATM_ASSERT(errorCode == 0);
 #endif // YATM_STD_THREAD
 		}
