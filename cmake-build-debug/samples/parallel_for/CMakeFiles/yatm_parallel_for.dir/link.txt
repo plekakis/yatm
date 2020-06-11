@@ -1,0 +1,1 @@
+/usr/bin/c++  -g   CMakeFiles/yatm_parallel_for.dir/yatm_parallel_for.cpp.o  -o yatm_parallel_for  -pthread 

@@ -510,8 +510,17 @@ namespace yatm
 			m_handle = CreateThread(nullptr, m_stackSizeInBytes, (LPTHREAD_START_ROUTINE)_function, _data, 0, &m_threadId);
 			YATM_ASSERT(m_handle != nullptr);
 #elif YATM_USE_PTHREADS
-			int32_t const errorCode = pthread_create(&m_thread, nullptr, (void*(*)(void*))_function, _data);
+			m_threadId = _index;
+
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+            pthread_attr_setstacksize (&attr, m_stackSizeInBytes);
+
+			int32_t const errorCode = pthread_create(&m_thread, &attr, (void*(*)(void*))_function, _data);
 			YATM_ASSERT(errorCode == 0);
+
+			pthread_attr_destroy(&attr);
 #endif // YATM_STD_THREAD
 		}
 
@@ -691,6 +700,10 @@ namespace yatm
 				}
 				worker_internal(queue, _index, current_job);
 			}
+
+#if YATM_USE_PTHREADS
+			pthread_exit(nullptr);
+#endif // YATM_USE_PTHREADS
 		}
 
 	public:

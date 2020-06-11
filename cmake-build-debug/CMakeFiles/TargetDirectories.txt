@@ -1,0 +1,10 @@
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/CMakeFiles/rebuild_cache.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/samples/CMakeFiles/rebuild_cache.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/samples/CMakeFiles/edit_cache.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/samples/parallel_for/CMakeFiles/rebuild_cache.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/samples/parallel_for/CMakeFiles/edit_cache.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/samples/parallel_for/CMakeFiles/yatm_parallel_for.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/samples/job_dependencies/CMakeFiles/rebuild_cache.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/samples/job_dependencies/CMakeFiles/edit_cache.dir
+/home/plekakis/Documents/GitHub/yatm/cmake-build-debug/samples/job_dependencies/CMakeFiles/yatm_job_dependencies.dir
