@@ -36,7 +36,7 @@
 #include <random>
 
 #ifndef YATM_ENABLE_WORK_STEALING
-	#define YATM_ENABLE_WORK_STEALING (0u)
+	#define YATM_ENABLE_WORK_STEALING (1u)
 #endif // YATM_ENABLE_WORK_STEALING
 
 #ifndef YATM_CACHE_LINE_SIZE
@@ -333,19 +333,19 @@ namespace yatm
 		// Wait on this condition variable.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Condition>
-		void wait(scoped_lock<mutex>& _lock, const Condition& _condition)
+		void wait(mutex& _lock, const Condition& _condition)
 		{
 #if YATM_STD_THREAD
 			m_cv.wait(_lock, _condition);
 #elif YATM_WIN64
 			while (!_condition())
 			{
-				SleepConditionVariableCS(&m_cv, &_lock.m_mutex->m_cs, INFINITE);
+				SleepConditionVariableCS(&m_cv, &_lock.m_cs, INFINITE);
 			}
 #elif YATM_USE_PTHREADS
 			while (!_condition())
 			{
-					pthread_cond_wait(&m_cv, &_lock.m_mutex->m_pmtx);
+					pthread_cond_wait(&m_cv, &_lock.m_pmtx);
 			}
 #endif // YATM_STD_THREAD
 		}
@@ -367,10 +367,7 @@ namespace yatm
 	{
 	public:
 		// -----------------------------------------------------------------------------------------------
-		counter()
-		{
-			m_value = 0u;
-		}
+		counter() : m_value(0u) { }
 
 		// -----------------------------------------------------------------------------------------------
 		counter(const counter&) = delete;
@@ -383,9 +380,9 @@ namespace yatm
 		{
 			uint32_t expected = 0u;
 #if YATM_STD_THREAD || YATM_USE_PTHREADS
-			return m_value.compare_exchange_strong(expected, get_current());
+			return m_value.compare_exchange_weak(expected, get_current());
 #elif YATM_WIN64
-			return m_value == expected;
+			return get_current() == expected;
 #endif // YATM_STD_THREAD
 		}
 
@@ -395,9 +392,9 @@ namespace yatm
 		bool is_equal(uint32_t _value)
 		{
 #if YATM_STD_THREAD || YATM_USE_PTHREADS
-			return m_value.compare_exchange_strong(_value, get_current());
+			return m_value.compare_exchange_weak(_value, get_current());
 #elif YATM_WIN64
-			return _value == m_value;
+			return get_current() == _value;
 #endif // YATM_STD_THREAD
 		}
 
@@ -430,12 +427,12 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Returns the current value of the internal atomic counter.
 		// -----------------------------------------------------------------------------------------------
-		uint32_t get_current() const
+		uint32_t get_current()
 		{
 #if YATM_STD_THREAD || YATM_USE_PTHREADS
 			return m_value.load();
 #elif YATM_WIN64
-			return m_value;
+			return InterlockedCompareExchange(&m_value, 0, 0);
 #endif // YATM_STD_THREAD
 		}
 
@@ -588,6 +585,179 @@ namespace yatm
 		uint32_t	m_jobQueueReservation = YATM_DEFAULT_JOB_QUEUE_RESERVATION;							// How many jobs to reserve in the job vector.
 		uint32_t	m_pendingJobQueueReservation = YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION;			// How many jobs to reserve in the pending job vector (jobs waiting to be kicked).
 	};
+	
+	// -----------------------------------------------------------------------------------------------
+	// A queue containing jobs to be processed.
+	// -----------------------------------------------------------------------------------------------
+	class job_queue
+	{
+	public:
+		job_queue()
+		{
+		}
+
+		~job_queue() 
+		{
+			m_queue.clear();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Lock this queue mutex.
+		// -----------------------------------------------------------------------------------------------
+		void lock()
+		{
+			m_mutex.lock();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Attempt to lock this queue mutex.
+		// -----------------------------------------------------------------------------------------------
+		bool try_lock()
+		{
+			return m_mutex.try_lock();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Unlock this queue mutex.
+		// -----------------------------------------------------------------------------------------------
+		void unlock()
+		{
+			m_mutex.unlock();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Notify the condition variable.
+		// -----------------------------------------------------------------------------------------------
+		void notify()
+		{
+			m_cv.notify_one();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Reserve N jobs for this queue.
+		// -----------------------------------------------------------------------------------------------
+		void reserve(size_t _size)
+		{
+			m_queue.reserve(_size);
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the job at the specified index and remove it from the queue.
+		// -----------------------------------------------------------------------------------------------
+		job* const get_job(uint32_t _index)
+		{
+			YATM_ASSERT(_index < size());
+			job* const j = m_queue[_index];
+			m_queue.erase(m_queue.begin() + _index);
+			return j;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the job at the specified index and remove it from the queue. Similar to get_job, but this time the workerMask is checked against the desired worker index.
+		// -----------------------------------------------------------------------------------------------
+		job* const get_job(uint32_t _index, uint32_t _workerIndex)
+		{
+			YATM_ASSERT(_index < size());
+			job* const j = m_queue[_index];
+
+			if ( (j->m_workerMask & (1u << _workerIndex)) != 0)
+			{
+				m_queue.erase(m_queue.begin() + _index);
+				return j;
+			}
+
+			return nullptr;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the job at the specified index, but do not remove it from the queue.
+		// -----------------------------------------------------------------------------------------------
+		job* const peek_job(uint32_t _index) const
+		{
+			YATM_ASSERT(_index < size());
+			return m_queue[_index];
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Push a job to the queue.
+		// -----------------------------------------------------------------------------------------------
+		void push_back(job* const _job)
+		{
+			m_queue.push_back(_job);
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Perform work stealing from candidate queues.
+		// -----------------------------------------------------------------------------------------------
+		void steal(job_queue* _candidates, uint32_t _size)
+		{
+#if YATM_ENABLE_WORK_STEALING
+			// If the queue job count is 0, then we can attempt to steal from another queue.
+			if (empty())
+			{
+				for (uint32_t i = 0; i < _size; ++i)
+				{
+					job_queue& otherQueue = _candidates[i];
+
+					// Skip empty queues and same index
+					if ((&otherQueue == this) || (_candidates[i].empty()))
+					{
+						continue;
+					}
+
+					// Find a compatible job for this queue.
+					otherQueue.lock();					
+					job* stolen_job = nullptr;
+					uint32_t jobIndex = 0u;
+					if (!otherQueue.empty())
+					{
+						do
+						{
+							stolen_job = otherQueue.get_job(jobIndex, i);
+						} while ((stolen_job == nullptr) && (jobIndex++ < otherQueue.size()));
+					}
+					otherQueue.unlock();
+
+					if (stolen_job != nullptr)
+					{
+						push_back(stolen_job);
+						break;
+					}
+				}
+			}
+#endif // YATM_ENABLE_WORK_STEALING
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the current size of the queue.
+		// -----------------------------------------------------------------------------------------------
+		size_t size() const
+		{
+			return m_queue.size();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Check if the queue is empty or not.
+		// -----------------------------------------------------------------------------------------------
+		bool empty() const
+		{
+			return size() == 0;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Wait until the condition is fulfilled.
+		// -----------------------------------------------------------------------------------------------
+		template<typename T>
+		void wait(T _predicate)
+		{
+			m_cv.wait(m_mutex, _predicate);
+		}
+
+	private:
+		std::vector<job*> m_queue;
+		mutex m_mutex;
+		condition_var m_cv;
+	};
 
 	// -----------------------------------------------------------------------------------------------
 	// The task scheduler, used to dispatch tasks for consumption by the worker threads.
@@ -607,7 +777,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Worker internal
 		// -----------------------------------------------------------------------------------------------
-		bool worker_internal(std::vector<job*>& _queue, uint32_t _index, job* _job)
+		bool worker_internal(job* _job)
 		{
 			if (_job != nullptr)
 			{
@@ -636,6 +806,35 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Get the next available compatible job and remove it from the queue.
+		// -----------------------------------------------------------------------------------------------
+		job* get_next_job(uint32_t _index)
+		{
+			job* current_job = nullptr;
+
+			job_queue& queue = m_queues[_index];
+
+			// Find the next job ready to be processed
+			for (uint32_t i = 0; i < queue.size(); ++i)
+			{
+				job* const j = queue.peek_job(i);
+				// Can this job be processed by this worker thread?
+				if (j->m_workerMask & (1u << _index))
+				{
+					// This job has 1 remaining task, which means that all its dependencies have been processed.
+					// Pick this task, removing it from the job queue.
+					if (j->m_pendingJobs.is_equal(1u))
+					{
+						current_job = queue.get_job(i);
+						break;
+					}
+				}
+			}
+
+			return current_job;
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Worker entry point; pulls jobs from the global queue and processes them.
 		// -----------------------------------------------------------------------------------------------
 		void worker_entry_point(uint32_t _index)
@@ -643,62 +842,19 @@ namespace yatm
 			while (m_isRunning)
 			{
 				YATM_ASSERT(_index < m_queueCount);
-				std::vector<job*>& queue = m_jobQueue[_index];
+				job_queue& queue = m_queues[_index];
 				job* current_job = nullptr;
 				{
-					scoped_lock<mutex> lock(&m_queueMutex);
+					queue.lock();
 
-#if YATM_ENABLE_WORK_STEALING
-					// If the queue job count is 0, then we can attempt to steal from another queue.
-					if (queue.size() == 0)
-					{
-						for (uint32_t i = 0; i < m_queueCount; ++i)
-						{
-							// Skip empty queues and same index
-							if ((_index == i) || (m_jobQueue[i].size() == 0))
-							{
-								continue;
-							}
-
-							// Not able to steal because the job is meant to run on a specific thread? skip
-							std::vector<job*>& otherQueue = m_jobQueue[i];
-							auto it = std::find_if(otherQueue.begin(), otherQueue.end(), [_index](job* j)
-							{
-								return (j->m_workerMask & (1u << _index)) != 0;
-							});
-
-							if (it != otherQueue.end())
-							{
-								queue.push_back(*it);
-								otherQueue.erase(it);
-								break;
-							}
-						}
-					}
-#endif // YATM_ENABLE_WORK_STEALING
+					queue.steal(m_queues, m_queueCount);
 
 					// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
-					m_queueConditionVar.wait(lock, [this, &queue] { return !is_paused() && ((queue.size() > 0u) || !is_running()); });
-
-					// Find the next job ready to be processed
-					for (uint32_t i = 0; i < queue.size(); ++i)
-					{
-						job* j = queue[i];
-						// Can this job be processed by this worker thread?
-						if (j->m_workerMask & (1u << _index))
-						{
-							// This job has 1 remaining task, which means that all its dependencies have been processed.
-							// Pick this task, removing it from the job queue.
-							if (j->m_pendingJobs.is_equal(1u))
-							{
-								current_job = j;
-								queue.erase(queue.begin() + i);
-								break;
-							}
-						}
-					}
+					queue.wait([this, &queue] { return !is_paused() && ((queue.size() > 0u) || !is_running()); });
+					current_job = get_next_job(_index);
+					queue.unlock();
 				}
-				worker_internal(queue, _index, current_job);
+				worker_internal(current_job);
 			}
 
 #if YATM_USE_PTHREADS
@@ -745,11 +901,7 @@ namespace yatm
 			delete m_scratch;
 			m_scratch = nullptr;
 
-			for (uint32_t i = 0; i < m_queueCount; ++i)
-			{
-				m_jobQueue[i].clear();
-			}
-			delete[] m_jobQueue;
+			delete[] m_queues;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -773,7 +925,7 @@ namespace yatm
 			}
 
 			m_queueCount = m_numThreads;
-			m_jobQueue = new std::vector<job*>[m_queueCount];
+			m_queues = new job_queue[m_queueCount];
 
 #if YATM_STD_THREAD
 			YATM_TTY("yatm is using std::thread, configurable stack size is not allowed");
@@ -787,7 +939,7 @@ namespace yatm
 			// reserve some space in the global job queue
 			for (uint32_t i = 0; i < m_queueCount; ++i)
 			{
-				m_jobQueue[i].reserve(_desc.m_jobQueueReservation);
+				m_queues[i].reserve(_desc.m_jobQueueReservation);
 			}
 
 			// reserve some space in the currently pending job queue
@@ -965,33 +1117,28 @@ namespace yatm
 				m_pendingJobsToAdd.clear();
 			}
 
-			m_queueConditionVar.notify_all();
+			for (uint32_t i = 0; i < m_queueCount; ++i)
+			{
+				m_queues[i].notify();
+			}
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Try to process the job on a compatible worker thread.
 		// -----------------------------------------------------------------------------------------------
 		void process_single_job()
-		{
-			yield();
-			/*
-			scoped_lock<mutex> lock(&m_queueMutex);
-			std::vector<job*>& queue = get_random_queue();
-			if (queue.size() > 0)
-			{
-				lock.unlock();
+		{			
+			uint32_t const index = get_random_queue_index();
 
-				// Find the worker able to process this job.
-				for (uint32_t i = 0; i < m_numThreads; ++i)
-				{
-					const uint32_t id = m_threadData[i].m_id;
-					if (worker_internal(queue, id))
-					{
-						return;
-					}
-				}
+			// Find compatible job to process
+			if (m_queues[index].try_lock())
+			{
+				job* current_job = get_next_job(index);
+				m_queues[index].unlock();
+
+				worker_internal(current_job);
 			}
-			*/
+			yield();						
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1049,7 +1196,10 @@ namespace yatm
 		void set_running(bool _running)
 		{
 			m_isRunning = _running;
-			m_queueConditionVar.notify_all();
+			for (uint32_t i = 0; i < m_queueCount; ++i)
+			{
+				m_queues[i].notify();
+			}
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1063,7 +1213,10 @@ namespace yatm
 		void set_paused(bool _paused)
 		{
 			m_isPaused = _paused;
-			m_queueConditionVar.notify_all();
+			for (uint32_t i = 0; i < m_queueCount; ++i)
+			{
+				m_queues[i].notify();
+			}
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1092,9 +1245,7 @@ namespace yatm
 			}
 		}
 
-	private:
-		condition_var			m_queueConditionVar;
-		mutex					m_queueMutex;
+	private:		
 		mutex					m_pendingJobsMutex;
 		size_t					m_stackSizeInBytes;
 		uint32_t				m_hwConcurency;
@@ -1106,7 +1257,7 @@ namespace yatm
 		bool					m_isRunning;
 		bool					m_isPaused;		
 		thread*					m_threads;
-		std::vector<job*>*		m_jobQueue;
+		job_queue*				m_queues;
 		std::vector<job*>		m_pendingJobsToAdd;
 
 #if YATM_DEBUG
@@ -1120,12 +1271,21 @@ namespace yatm
 #endif // YATM_DEBUG
 
 		// -----------------------------------------------------------------------------------------------
-		// Get a random queue.
+		// Get a random queue index
 		// -----------------------------------------------------------------------------------------------
-		std::vector<job*>& get_random_queue()
+		uint32_t get_random_queue_index() const
 		{
 			uint32_t const index = std::rand() % m_queueCount;
-			return m_jobQueue[index];
+			return index;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get a random queue.
+		// -----------------------------------------------------------------------------------------------
+		job_queue& get_random_queue()
+		{
+			uint32_t const index = get_random_queue_index();
+			return m_queues[index];
 		}
 
 		// -----------------------------------------------------------------------------------------------
