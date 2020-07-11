@@ -73,13 +73,14 @@
 #if YATM_STD_THREAD
 #undef YATM_WIN64
 #undef YATM_LINUX
+#undef YATM_APPLE
 #endif // YATM_STD_THREAD
 
 #if YATM_WIN64
 	#define NOMINMAX
 	#define WIN32_LEAN_AND_MEAN
 	#include <Windows.h>
-#elif YATM_LINUX
+#elif YATM_LINUX || YATM_APPLE
 	#include <unistd.h>
 #elif YATM_STD_THREAD
 	#include <thread>
@@ -88,7 +89,7 @@
 	#include <chrono>
 #endif // YATM_WIN64
 
-#define YATM_USE_PTHREADS (YATM_LINUX)
+#define YATM_USE_PTHREADS (YATM_LINUX || YATM_APPLE)
 
 #if YATM_USE_PTHREADS
 	#include <pthread.h>
@@ -553,7 +554,7 @@ namespace yatm
 			YATM_ASSERT(h == m_threadId);
 	#endif // YATM_DEBUG
 			return (size_t)m_threadId;
-#elif YATM_LINUX
+#elif YATM_LINUX || YATM_APPLE
 			return m_threadId;
 #endif // YATM_STD_THREAD
 		}
@@ -876,7 +877,7 @@ namespace yatm
 			ZeroMemory(&info, sizeof(info));
 			GetSystemInfo(&info);
 			m_hwConcurency = info.dwNumberOfProcessors;
-#elif YATM_LINUX
+#elif YATM_LINUX || YATM_APPLE
 			m_hwConcurency = sysconf(_SC_NPROCESSORS_CONF);
 #endif // YATM_STD_THREAD
 		}
@@ -1175,8 +1176,10 @@ namespace yatm
 			std::this_thread::yield();
 #elif YATM_WIN64
 			SwitchToThread();
-#elif YATM_USE_PTHREADS
+#elif YATM_LINUX
 			pthread_yield();
+#elif YATM_APPLE
+			sched_yield();
 #endif // YATM_STD_THREAD
 		}
 
@@ -1228,7 +1231,7 @@ namespace yatm
 			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 #elif YATM_WIN64
 			Sleep(ms);
-#elif YATM_LINUX
+#elif YATM_LINUX || YATM_APPLE
 			usleep(ms * 1000);
 #endif // YATM_STD_THREAD
 		}
