@@ -450,7 +450,13 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	struct alignas(YATM_CACHE_LINE_SIZE) job
 	{
-		using JobFuncPtr = std::function<void(void* const)>;
+		enum flags
+		{
+			JF_None = 0x0,
+			JF_Recurring = 0x1
+		};
+
+		using JobFuncPtr = std::function<bool(void* const)>;
 
 		JobFuncPtr	m_function;
 		void*		m_data;
@@ -458,6 +464,7 @@ namespace yatm
 		job*		m_parent;
 		uint32_t	m_workerMask;
 		counter		m_pendingJobs;
+		uint32_t    m_flags;
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -778,32 +785,47 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Worker internal
 		// -----------------------------------------------------------------------------------------------
-		bool worker_internal(job* _job)
+		bool worker_internal(job* _job, job_queue& _queue)
 		{
+			bool isJobFinished = true;
+
 			if (_job != nullptr)
 			{
+				// Recurring jobs do not leave the queue until the worker function says so.
+				bool const isRecurring = (_job->m_flags & job::JF_Recurring) != 0;
+				
 				// process job
 				if (_job->m_function != nullptr)
 				{
-					_job->m_function(_job->m_data);
+					isJobFinished = _job->m_function(_job->m_data);
 				}
 
-				// decrement the counter
-				if (_job->m_counter != nullptr)
+				// Job has finished.
+				if (isJobFinished || !isRecurring)
 				{
-					_job->m_counter->decrement();
-				}
+					// decrement the counter
+					if (_job->m_counter != nullptr)
+					{
+						_job->m_counter->decrement();
+					}
 
-				// Finish job, notifying parents recursively.
-				finish_job(_job);
+					// Finish job, notifying parents recursively.
+					finish_job(_job);
+				}
+				// Job has not finished yet, but we need to re-add it to the queue as it needs to be reprocessed.
+				else if (isRecurring)
+				{
+					_queue.lock();
+					_queue.push_back(_job);
+					_queue.unlock();
+				}
 			}
 			else
 			{
 				// No jobs, simply yield.
 				yield();
 			}
-
-			return (_job != nullptr);
+			return isJobFinished;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -855,7 +877,7 @@ namespace yatm
 					current_job = get_next_job(_index);
 					queue.unlock();
 				}
-				worker_internal(current_job);
+				worker_internal(current_job, queue);
 			}
 
 #if YATM_USE_PTHREADS
@@ -995,7 +1017,7 @@ namespace yatm
 		// Create a job from the scheduler scratch allocator.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Function>
-		job* const create_job(const Function& _function, void* const _data, counter* _counter)
+		job* const create_job(const Function& _function, void* const _data, counter* _counter, job::flags _flags = job::JF_None)
 		{
 			job* const j = allocate<job>();
 
@@ -1004,6 +1026,7 @@ namespace yatm
 			j->m_parent = nullptr;
 			j->m_counter = _counter;
 			j->m_workerMask = m_currentWorkerMasks[m_currentWorkerMaskDepth];
+			j->m_flags = _flags;
 
 			// Initialise the job with 1 pending job (itself).
 			// Adding dependencies increments the pending counter, resolving dependencies decrements it.
@@ -1137,7 +1160,7 @@ namespace yatm
 				job* current_job = get_next_job(index);
 				m_queues[index].unlock();
 
-				worker_internal(current_job);
+				worker_internal(current_job, m_queues[index]);
 			}
 			yield();						
 		}
