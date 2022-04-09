@@ -446,6 +446,93 @@ namespace yatm
 	};
 
 	// -----------------------------------------------------------------------------------------------
+	// A representation of a TLS member.
+	// -----------------------------------------------------------------------------------------------
+	template<class T>
+	class tls
+	{
+		static uint32_t const s_invalidTlsIndex = 0xffffffff;
+#if YATM_WIN64
+		static_assert(s_invalidTlsIndex == TLS_OUT_OF_INDEXES);
+#endif
+
+	public:
+		// -----------------------------------------------------------------------------------------------
+		tls()
+		{
+#if YATM_STD_THREAD
+
+#elif YATM_USE_PTHREADS
+			if (pthread_key_create(&m_tlsIndex, nullptr) != 0)
+			{
+				m_tlsIndex = s_invalidTlsIndex;
+			}
+
+#elif YATM_WIN64
+			m_tlsIndex = TlsAlloc();
+#endif // YATM_STD_THREAD
+
+			YATM_ASSERT(m_tlsIndex != s_invalidTlsIndex);
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		~tls()
+		{
+			if (m_tlsIndex != s_invalidTlsIndex)
+			{
+#if YATM_STD_THREAD
+
+#elif YATM_USE_PTHREADS
+				pthread_key_delete(m_tlsIndex);
+#elif YATM_WIN64
+				TlsFree(m_tlsIndex);
+#endif // YATM_STD_THREAD
+			}
+		}
+
+		tls(const tls&) = delete;
+		tls& operator=(const tls&) = delete;
+
+		// -----------------------------------------------------------------------------------------------
+		void set(T* const data)
+		{
+			YATM_ASSERT(m_tlsIndex != s_invalidTlsIndex);
+#if YATM_STD_THREAD
+
+#elif YATM_USE_PTHREADS
+			pthread_setspecific(m_tlsIndex, data);
+#elif YATM_WIN64
+			TlsSetValue(m_tlsIndex, data);
+#endif // YATM_STD_THREAD
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		T* const get() const
+		{
+			YATM_ASSERT(m_tlsIndex != s_invalidTlsIndex);
+
+			T* data = nullptr;
+#if YATM_STD_THREAD
+
+#elif YATM_USE_PTHREADS
+			data = static_cast<T* const>(pthread_getspecific(m_tlsIndex));
+#elif YATM_WIN64			
+			data = static_cast<T* const>(TlsGetValue(m_tlsIndex));
+#endif // YATM_STD_THREAD
+			return data;
+		}
+
+	private:
+#if YATM_STD_THREAD
+
+#elif YATM_USE_PTHREADS
+		uint32_t m_tlsIndex;
+#elif YATM_WIN64
+		DWORD m_tlsIndex;
+#endif // YATM_STD_THREAD
+	};
+
+	// -----------------------------------------------------------------------------------------------
 	// Describes a job that the scheduler can run.
 	// -----------------------------------------------------------------------------------------------
 	struct alignas(YATM_CACHE_LINE_SIZE) job
@@ -1110,6 +1197,37 @@ namespace yatm
 					for (uint32_t i = 0; i < n; ++i)
 					{
 						job* j = create_job(_function, &(*(_begin + i)), &jobs_done);
+					}
+
+					kick();
+					wait(&jobs_done);
+				}
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Creates a parallel for loop for the specified collection, launching _function per iteration.
+		// Blocks until all are complete.
+		// -----------------------------------------------------------------------------------------------
+		template<typename Function>
+		void parallel_for(uint32_t _begin, uint32_t _end, const Function& _function)
+		{
+			YATM_ASSERT(_end > _begin);
+
+			const size_t n = (_end - _begin);
+			if (n > 0)
+			{
+				// When there is only 1 job, don't pass it through the scheduler.
+				if (n == 1)
+				{
+					_function((void* const)_begin);
+				}
+				else
+				{
+					counter jobs_done;
+					for (uint32_t i = 0; i < n; ++i)
+					{
+						job* j = create_job(_function, (void* const)(_begin + i), &jobs_done);
 					}
 
 					kick();
