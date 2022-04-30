@@ -598,12 +598,11 @@ namespace yatm
 
 #if YATM_STD_THREAD
 			m_thread = std::thread(_function, _data);
+			m_threadId = m_thread.get_id();
 #elif YATM_WIN64
 			m_handle = CreateThread(nullptr, m_stackSizeInBytes, (LPTHREAD_START_ROUTINE)_function, _data, 0, &m_threadId);
 			YATM_ASSERT(m_handle != nullptr);
 #elif YATM_USE_PTHREADS
-			m_threadId = _index;
-
             pthread_attr_t attr;
             pthread_attr_init(&attr);
             pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
@@ -611,6 +610,8 @@ namespace yatm
 
 			int32_t const errorCode = pthread_create(&m_thread, &attr, (void*(*)(void*))_function, _data);
 			YATM_ASSERT(errorCode == 0);
+
+			m_threadId = (uint32_t)m_thread.thread;
 
 			pthread_attr_destroy(&attr);
 #endif // YATM_STD_THREAD
@@ -640,8 +641,12 @@ namespace yatm
 		size_t get_id() const
 		{
 #if YATM_STD_THREAD
+	#if YATM_DEBUG
 			std::hash<std::thread::id> h;
-			return h(m_thread.get_id());
+			uint32_t const index = h(m_thread.get_id());
+			YATM_ASSERT(h == m_threadId);
+	#endif // YATM_DEBUG
+			return m_threadId;
 #elif YATM_WIN64
 	#if YATM_DEBUG
 			DWORD h = GetThreadId(m_handle);
@@ -656,6 +661,7 @@ namespace yatm
 	private:
 #if YATM_STD_THREAD
 		std::thread m_thread;
+		uint32_t    m_threadId;
 #elif YATM_WIN64
 		HANDLE		m_handle;
 		DWORD		m_threadId;
@@ -1306,6 +1312,23 @@ namespace yatm
 				// Process jobs while waiting
 				process_single_job();
 			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the current thread id.
+		// -----------------------------------------------------------------------------------------------
+		uint32_t get_current_thread_id() const
+		{
+#if YATM_STD_THREAD
+			return std::this_thread::get_id();
+#elif YATM_WIN64
+			return GetCurrentThreadId();
+#elif YATM_USE_PTHREADS
+			pthread_id_np_t tid;
+			pthread_t const self = pthread_self();
+			pthread_getunique_np(&self, &tid);
+			return tid;
+#endif // YATM_STD_THREAD
 		}
 
 		// -----------------------------------------------------------------------------------------------
