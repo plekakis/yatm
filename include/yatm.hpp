@@ -25,7 +25,6 @@
 #pragma once
 
 #include <vector>
-#include <atomic>
 #include <algorithm>
 #include <cstdlib>
 #include <cassert>
@@ -34,6 +33,44 @@
 #include <limits.h>
 #include <memory.h>
 #include <random>
+
+// Compiler detection
+#ifdef _MSC_VER
+	#define YATM_COMPILER_MSVC 1
+#elif defined(__GNUC__) || defined(__GNUG__)
+	#define YATM_COMPILER_GCC 1
+#elif defined(__clang)
+	#define YATM_COMPILER_CLANG 1
+#else
+	#error Unsupported compiler
+#endif // _MSC_VER
+
+// Platform detection
+#ifdef _WIN32
+	#define YATM_PLATFORM_WINDOWS 1
+#elif defined(__APPLE__)
+	#define YATM_PLATFORM_APPLE 1
+#elif defined(__unix__)
+	#define YATM_PLATFORM_UNIX 1
+#elif defined(__linux__)
+	#define YATM_PLATFORM_LINUX 1
+#else
+	#error Unsupported platform
+#endif
+
+// Make sure we don't have the following already defined.
+#if defined(YATM_WIN64) || defined(YATM_NIX) || defined(YATM_APPLE)
+	#error yatm implementation already defined, this is not allowed
+#endif
+
+// Initial codepath support based on platform
+#if YATM_PLATFORM_WINDOWS
+	#define YATM_WIN64 1
+#elif YATM_PLATFORM_APPLE
+	#define YATM_APPLE 1
+#elif YATM_PLATFORM_UNIX || YATM_PLATFORM_LINUX
+	#define YATM_NIX 1
+#endif // YATM_PLATFORM_WINDOWS
 
 #ifndef YATM_ENABLE_WORK_STEALING
 	#define YATM_ENABLE_WORK_STEALING (1u)
@@ -46,14 +83,6 @@
 #ifndef YATM_DEFAULT_STACK_SIZE
 	#define YATM_DEFAULT_STACK_SIZE (1024u * 1024u)
 #endif // YATM_DEFAULT_STACK_SIZE
-
-#ifndef YATM_DEFAULT_JOB_SCRATCH_BUFFER_SIZE
-	#define YATM_DEFAULT_JOB_SCRATCH_BUFFER_SIZE (128u * 1024u)
-#endif // YATM_DEFAULT_STACK_SIZE
-
-#ifndef YATM_MAX_WORKER_MASK_STACK_DEPTH
-	#define YATM_MAX_WORKER_MASK_STACK_DEPTH (64u)
-#endif // YATM_MAX_WORKER_MASK_STACK_DEPTH
 
 #ifndef YATM_ASSERT
 	#define YATM_ASSERT(x) assert((x))
@@ -69,31 +98,25 @@
 	#endif //_MSC_VER
 #endif // YATM_DEBUG
 
-// When STD_THREAD is defined, undef platform_specific.
-#if YATM_STD_THREAD
-#undef YATM_WIN64
-#undef YATM_LINUX
-#undef YATM_APPLE
-#endif // YATM_STD_THREAD
-
 #if YATM_WIN64
 	#define NOMINMAX
 	#define WIN32_LEAN_AND_MEAN
 	#include <Windows.h>
-#elif YATM_LINUX || YATM_APPLE
+	#define YATM_WIN64_ATOMICS 1
+#elif YATM_NIX || YATM_APPLE
 	#include <unistd.h>
-#elif YATM_STD_THREAD
-	#include <thread>
-	#include <condition_variable>
-	#include <atomic>
-	#include <chrono>
+	#define YATM_GCC_ATOMICS 1
 #endif // YATM_WIN64
 
-#define YATM_USE_PTHREADS (YATM_LINUX || YATM_APPLE)
+#define YATM_USE_PTHREADS (YATM_NIX || YATM_APPLE)
 
 #if YATM_USE_PTHREADS
 	#include <pthread.h>
 #endif // YATM_USE_PTHREADS
+
+#if !(YATM_GCC_ATOMICS || YATM_WIN64_ATOMICS)
+	#error Unknown atomics implementation
+#endif
 
 // Some defaults for reserving space in the job queues
 
@@ -105,12 +128,113 @@
 	#define YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION (128u)
 #endif // YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION
 
+#define YATM_ATOMIC_ALIGN alignas(8) volatile
+
+#if YATM_COMPILER_MSVC
+	#define YATM_ALLOCA(x) _malloca((x))
+	#define YATM_FREEA(x) _freea((x))
+#else
+	#define YATM_ALLOCA(x) alloca((x))
+	#define YATM_FREEA(x) 
+#endif
+
+namespace yatm
+{
+	// -----------------------------------------------------------------------------------------------
+	// A portable aligned allocation mechanism.
+	//
+	// Thanks to: https://gist.github.com/dblalock/255e76195676daa5cbc57b9b36d1c99a
+	// -----------------------------------------------------------------------------------------------
+
+	// -----------------------------------------------------------------------------------------------
+	class default_alloc
+	{
+	public:
+		static void* aligned_alloc(uint64_t _size, uint64_t _alignment)
+		{
+			YATM_ASSERT(_alignment < UINT8_MAX);
+
+			// over-allocate using malloc and adjust pointer by the offset needed to align the memory to specified alignment
+			const auto request_size = _size + _alignment;
+			uint8_t* buf = (uint8_t*)malloc(request_size);
+
+			// figure out how much we should offset our allocation by
+			const uint64_t remainder = ((uint64_t)buf) % _alignment;
+			const uint64_t offset = _alignment - remainder;
+			uint8_t* ret = buf + (uint8_t)offset;
+
+			// store how many extra bytes we allocated in the byte just before the pointer we return
+			*(uint8_t*)(ret - 1) = (uint8_t)offset;
+
+			return ret;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		static void aligned_free(const void* const aligned_ptr)
+		{
+			// find the base allocation by extracting the stored aligned offset and free it
+			uint32_t offset = *(((uint8_t*)aligned_ptr) - 1);
+			free(((uint8_t*)aligned_ptr) - offset);
+		}
+	};
+}
+
+#ifndef YATM_ALLOC
+	#define YATM_ALLOC(type, alignment) yatm::default_alloc::aligned_alloc(sizeof(type), (alignment));
+#endif // YATM_ALLOC
+
+#ifndef YATM_ALLOC_COUNT
+	#define YATM_ALLOC_COUNT(type, count, alignment) yatm::default_alloc::aligned_alloc(sizeof(type) * (count), (alignment));
+#endif // YATM_ALLOC_COUNT
+
+#ifndef YATM_FREE
+	#define YATM_FREE(ptr) yatm::default_alloc::aligned_free((ptr))
+#endif // YATM_fREE
+
 namespace yatm
 {
 	static_assert(sizeof(void*) == 8, "Only 64bit platforms are currently supported");
 
 	// -----------------------------------------------------------------------------------------------
-	// std::bind wrapped, used specifically for the job callbacks.
+	// Thread priority.
+	// -----------------------------------------------------------------------------------------------
+	enum class thread_priority : uint8_t
+	{
+		lowest,
+		below_normal,
+		normal,
+		above_normal,
+		highest,
+		time_critical
+	};
+
+	// -----------------------------------------------------------------------------------------------
+	// Helper templated random function.
+	// -----------------------------------------------------------------------------------------------
+	template<typename T>
+	T random(T _from, T _to)
+	{
+		std::random_device                  device;
+		std::mt19937                        generator(device());
+		std::uniform_int_distribution<T>    distr(_from, _to);
+		return distr(generator);
+	}
+
+	// -----------------------------------------------------------------------------------------------
+	// Prevent copy & move operations.
+	// -----------------------------------------------------------------------------------------------
+	class no_copy_no_move
+	{
+	public:
+		no_copy_no_move() = default;
+		no_copy_no_move(const no_copy_no_move&) = delete;
+		no_copy_no_move& operator=(const no_copy_no_move&) = delete;
+		no_copy_no_move(no_copy_no_move&&) = delete;
+		no_copy_no_move& operator=(no_copy_no_move&&) = delete;
+	};
+
+	// -----------------------------------------------------------------------------------------------
+	// std::bind wrapper, used specifically for the job callbacks.
 	// -----------------------------------------------------------------------------------------------
 	template<typename Fx, typename... Args>
 	static auto bind(Fx&& _function, Args&&... _args)
@@ -121,7 +245,7 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	// Align input to the next specified alignment.
 	// -----------------------------------------------------------------------------------------------
-	static size_t align(size_t _value, size_t _align)
+	static uint64_t align(uint64_t _value, uint64_t _align)
 	{
 		return (_value + (_align - 1)) & ~(_align - 1);
 	}
@@ -129,15 +253,185 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	// Align pointer to the next specified alignment.
 	// -----------------------------------------------------------------------------------------------
-	static uint8_t* align_ptr(uint8_t* _ptr, size_t _align)
+	static uint8_t* align_ptr(uint8_t* _ptr, uint64_t _align)
 	{
-		return (uint8_t*)align((size_t)_ptr, _align);
+		return (uint8_t*)align((uint64_t)_ptr, _align);
 	}
+
+	// -----------------------------------------------------------------------------------------------
+	// Interlocked API for atomic operations.
+	// 
+	// Follows the Win32 convention about return values;
+	// - Add, Increment, Decrement: return the post-operation value.
+	// - All the rest: return ther pre-operation value.
+	// -----------------------------------------------------------------------------------------------
+	class atomic : public no_copy_no_move
+	{
+	public:
+		static int32_t interlocked_increment(int32_t volatile* _addend)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedIncrement((LONG volatile*)_addend);
+#elif YATM_GCC_ATOMICS
+			return __sync_add_and_fetch_4(_addend, 1);
+#endif
+		}
+
+		static int64_t interlocked_increment64(int64_t volatile* _addend)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedIncrement64((LONG64 volatile*)_addend);
+#elif YATM_GCC_ATOMICS
+			return __sync_add_and_fetch_8(_addend, 1);
+#endif
+		}
+
+		static int32_t interlocked_decrement(int32_t volatile* _addend)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedDecrement((LONG volatile*)_addend);
+#elif YATM_GCC_ATOMICS
+			return __sync_sub_and_fetch_4(_addend, 1);
+#endif
+		}
+
+		static int64_t interlocked_decrement64(int64_t volatile* _addend)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedDecrement64((LONG64 volatile*)_addend);
+#elif YATM_GCC_ATOMICS
+			return __sync_sub_and_fetch_8(_addend, 1);
+#endif
+		}
+
+		static int32_t interlocked_add(int32_t volatile* _addend, int32_t _value)
+		{
+#if YATM_WIN64_ATOMICS		
+			return InterlockedAdd((LONG volatile*)_addend, (LONG)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_add_and_fetch_4(_addend, _value);
+#endif
+		}
+
+		static int64_t interlocked_add64(int64_t volatile* _addend, int64_t _value)
+		{
+#if YATM_WIN64_ATOMICS		
+			return InterlockedAdd64((LONG64 volatile*)_addend, (LONG64)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_add_and_fetch_8(_addend, _value);
+#endif
+		}
+
+		static int32_t interlocked_and(int32_t volatile* _addend, int32_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedAnd((LONG volatile*)_addend, (LONG)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_fetch_and_and_4(_addend, _value);
+#endif
+		}
+
+		static int64_t interlocked_and64(int64_t volatile* _addend, int64_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedAnd64((LONG64 volatile*)_addend, (LONG64)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_fetch_and_and_8(_addend, _value);
+#endif
+		}
+
+		static int32_t interlocked_or(int32_t volatile* _addend, int32_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedOr((LONG volatile*)_addend, (LONG)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_fetch_and_or_4(_addend, _value);
+#endif
+		}
+
+		static int64_t interlocked_or64(int64_t volatile* _addend, int64_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedOr64((LONG64 volatile*)_addend, (LONG64)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_fetch_and_or_8(_addend, _value);
+#endif
+		}
+
+		static int32_t interlocked_xor(int32_t volatile* _addend, int32_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedXor((LONG volatile*)_addend, (LONG)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_fetch_and_xor_4(_addend, _value);
+#endif
+		}
+
+		static int64_t interlocked_xor64(int64_t volatile* _addend, int64_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedXor64((LONG64 volatile*)_addend, (LONG64)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_fetch_and_xor_8(_addend, _value);
+#endif
+		}
+
+		static int32_t interlocked_exchange(int32_t volatile* _destination, int32_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedExchange((LONG volatile*)_destination, (LONG)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_swap_4(_destination, _value);
+#endif
+		}
+
+		static int64_t interlocked_exchange64(int64_t volatile* _destination, int64_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedExchange64((LONG64 volatile*)_destination, (LONG64)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_swap_8(_destination, _value);
+#endif
+		}
+
+		static int32_t interlocked_compare_exchange(int32_t volatile* _destination, int32_t _exchange, int32_t _comperand)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedCompareExchange((LONG volatile*)_destination, (LONG)_exchange, (LONG)_comperand);
+#elif YATM_GCC_ATOMICS
+			return __sync_val_compare_and_swap_4(_destination, _compreand, _exchange);
+#endif
+		}
+
+		static int64_t interlocked_compare_exchange64(int64_t volatile* _destination, int64_t _exchange, int64_t _comperand)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedCompareExchange64((LONG64 volatile*)_destination, (LONG64)_exchange, (LONG64)_comperand);
+#elif YATM_GCC_ATOMICS
+			return __sync_val_compare_and_swap_8(_destination, _compreand, _exchange);
+#endif
+		}
+
+		static void* interlocked_compare_exchange_ptr(void* volatile* _destination, void* _exchange, void* _comperand)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedCompareExchangePointer(_destination, _exchange, _comperand);
+#elif YATM_GCC_ATOMICS
+			return (void*)__sync_val_compare_and_swap_8((int64_t*)_destination, (int64_t)_compreand, (int64_t)_exchange);
+#endif
+		}
+
+	private:
+#if YATM_WIN64
+		static_assert(sizeof(LONG) == sizeof(int32_t));
+		static_assert(sizeof(LONG64) == sizeof(int64_t));
+#endif
+	};
 
 	// -----------------------------------------------------------------------------------------------
 	// A representation of an OS mutex.
 	// -----------------------------------------------------------------------------------------------
-	class mutex
+	class mutex : public no_copy_no_move
 	{
 		friend class condition_var;
 	public:
@@ -150,10 +444,6 @@ namespace yatm
 			pthread_mutex_init(&m_pmtx, nullptr);
 #endif // YATM_WIN64
 		}
-
-		// -----------------------------------------------------------------------------------------------
-		mutex(const mutex&) = delete;
-		mutex operator=(const mutex&) = delete;
 
 		// -----------------------------------------------------------------------------------------------
 		~mutex()
@@ -171,14 +461,12 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void lock()
 		{
-#if YATM_STD_THREAD
-			m_mutex.lock();
-#elif YATM_WIN64
+#if YATM_WIN64
 			EnterCriticalSection(&m_cs);
 #elif YATM_USE_PTHREADS
 			int32_t const errorCode = pthread_mutex_lock(&m_pmtx);
 			YATM_ASSERT(errorCode == 0);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -187,13 +475,11 @@ namespace yatm
 		bool try_lock()
 		{
 			bool v = false;
-#if YATM_STD_THREAD
-			v = m_mutex.try_lock();
-#elif YATM_WIN64
+#if YATM_WIN64
 			v = TryEnterCriticalSection(&m_cs);
 #elif YATM_USE_PTHREADS
 			v = (pthread_mutex_trylock(&m_pmtx) == 0);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 
 			return v;
 		}
@@ -203,31 +489,27 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void unlock()
 		{
-#if YATM_STD_THREAD
-			m_mutex.unlock();
-#elif YATM_WIN64
+#if YATM_WIN64
 			LeaveCriticalSection(&m_cs);
 #elif YATM_USE_PTHREADS
 			int32_t const errorCode = pthread_mutex_unlock(&m_pmtx);
 			YATM_ASSERT(errorCode == 0);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 	private:
-#if YATM_STD_THREAD
-		std::mutex m_mutex;
-#elif YATM_WIN64
+#if YATM_WIN64
 		CRITICAL_SECTION m_cs;
 #elif YATM_USE_PTHREADS
 		pthread_mutex_t m_pmtx;
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 	};
 
 	// -----------------------------------------------------------------------------------------------
 	// A scoped-lock mechanism for mutexes.
 	// -----------------------------------------------------------------------------------------------
 	template<typename T>
-	class scoped_lock
+	class scoped_lock : public no_copy_no_move
 	{
 		friend class condition_var;
 	public:
@@ -242,10 +524,6 @@ namespace yatm
 		{
 			unlock();
 		}
-
-		// -----------------------------------------------------------------------------------------------
-		scoped_lock(const scoped_lock&) = delete;
-		scoped_lock& operator=(const scoped_lock&) = delete;
 
 		// -----------------------------------------------------------------------------------------------
 		void lock()
@@ -275,7 +553,7 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	// A representation of an OS condition variable.
 	// -----------------------------------------------------------------------------------------------
-	class condition_var
+	class condition_var : public no_copy_no_move
 	{
 	public:
 		// -----------------------------------------------------------------------------------------------
@@ -291,29 +569,21 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		~condition_var()
 		{
-#if YATM_WIN64
-
-#elif YATM_USE_PTHREADS
+#if YATM_USE_PTHREADS
 			pthread_cond_destroy(&m_cv);
-#endif // YATM_WIN64
+#endif // YATM_USE_PTHREADS
 		}
-
-		// -----------------------------------------------------------------------------------------------
-		condition_var(const condition_var&) = delete;
-		condition_var& operator=(const condition_var&) = delete;
 
 		// -----------------------------------------------------------------------------------------------
 		// Notify all threads waiting on this condition variable.
 		// -----------------------------------------------------------------------------------------------
 		void notify_all()
 		{
-#if YATM_STD_THREAD
-			m_cv.notify_all();
-#elif YATM_WIN64
+#if YATM_WIN64
 			WakeAllConditionVariable(&m_cv);
 #elif YATM_USE_PTHREADS
 			pthread_cond_broadcast(&m_cv);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -321,13 +591,11 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void notify_one()
 		{
-#if YATM_STD_THREAD
-			m_cv.notify_one();
-#elif YATM_WIN64
+#if YATM_WIN64
 			WakeConditionVariable(&m_cv);
 #elif YATM_USE_PTHREADS
 			pthread_cond_signal(&m_cv);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -336,9 +604,7 @@ namespace yatm
 		template<typename Condition>
 		void wait(mutex& _lock, const Condition& _condition)
 		{
-#if YATM_STD_THREAD
-			m_cv.wait(_lock, _condition);
-#elif YATM_WIN64
+#if YATM_WIN64
 			while (!_condition())
 			{
 				SleepConditionVariableCS(&m_cv, &_lock.m_cs, INFINITE);
@@ -346,19 +612,17 @@ namespace yatm
 #elif YATM_USE_PTHREADS
 			while (!_condition())
 			{
-					pthread_cond_wait(&m_cv, &_lock.m_pmtx);
+				pthread_cond_wait(&m_cv, &_lock.m_pmtx);
 			}
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 	private:
-#if YATM_STD_THREAD
-		std::condition_variable_any m_cv;
-#elif YATM_WIN64
+#if YATM_WIN64
 		CONDITION_VARIABLE m_cv;
 #elif YATM_USE_PTHREADS
 		pthread_cond_t m_cv;
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -374,17 +638,27 @@ namespace yatm
 		counter(const counter&) = delete;
 		counter& operator=(const counter&) = delete;
 
+		counter(counter&& other) noexcept
+		{
+			*this = std::move(other);
+		}
+
+		counter& operator=(counter&& other) noexcept
+		{
+			if (this != &other)
+			{
+				m_value = other.m_value;
+				other.m_value = 0;				
+			}
+			return *this;
+		}
+
 		// -----------------------------------------------------------------------------------------------
 		// Checks if the internal atomic counter has reached 0.
 		// -----------------------------------------------------------------------------------------------
 		bool is_done()
 		{
-			uint32_t expected = 0u;
-#if YATM_STD_THREAD || YATM_USE_PTHREADS
-			return m_value.compare_exchange_weak(expected, get_current());
-#elif YATM_WIN64
-			return get_current() == expected;
-#endif // YATM_STD_THREAD
+			return is_equal(0);
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -392,11 +666,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		bool is_equal(uint32_t _value)
 		{
-#if YATM_STD_THREAD || YATM_USE_PTHREADS
-			return m_value.compare_exchange_weak(_value, get_current());
-#elif YATM_WIN64
-			return get_current() == _value;
-#endif // YATM_STD_THREAD
+			return atomic::interlocked_compare_exchange(&m_value, _value, _value) == _value;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -404,12 +674,8 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		uint32_t increment()
 		{
-			YATM_ASSERT(get_current() < UINT_MAX);
-#if YATM_STD_THREAD || YATM_USE_PTHREADS
-			return ++m_value;
-#elif YATM_WIN64
-			return InterlockedIncrement(&m_value);
-#endif // YATM_STD_THREAD
+			YATM_ASSERT(get_current() < std::numeric_limits<uint32_t>::max());
+			return atomic::interlocked_increment(&m_value);
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -418,11 +684,7 @@ namespace yatm
 		uint32_t decrement()
 		{
 			YATM_ASSERT(get_current() != 0);
-#if YATM_STD_THREAD || YATM_USE_PTHREADS
-			return --m_value;
-#elif YATM_WIN64
-			return InterlockedDecrement(&m_value);
-#endif // YATM_STD_THREAD
+			return atomic::interlocked_decrement(&m_value);
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -430,26 +692,18 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		uint32_t get_current()
 		{
-#if YATM_STD_THREAD || YATM_USE_PTHREADS
-			return m_value.load();
-#elif YATM_WIN64
-			return InterlockedCompareExchange(&m_value, 0, 0);
-#endif // YATM_STD_THREAD
+			return atomic::interlocked_compare_exchange(&m_value, 0, 0);
 		}
 
 	private:
-#if YATM_STD_THREAD || YATM_USE_PTHREADS
-		std::atomic_uint32_t m_value;
-#elif YATM_WIN64
-		LONG m_value;
-#endif // YATM_STD_THREAD
+		YATM_ATOMIC_ALIGN int32_t m_value;
 	};
 
 	// -----------------------------------------------------------------------------------------------
 	// A representation of a TLS member.
 	// -----------------------------------------------------------------------------------------------
 	template<class T>
-	class tls
+	class tls : public no_copy_no_move
 	{
 		static uint32_t const s_invalidTlsIndex = 0xffffffff;
 #if YATM_WIN64
@@ -459,10 +713,8 @@ namespace yatm
 	public:
 		// -----------------------------------------------------------------------------------------------
 		tls()
-		{
-#if YATM_STD_THREAD
-
-#elif YATM_USE_PTHREADS
+		{		
+#if YATM_USE_PTHREADS
 			if (pthread_key_create(&m_tlsIndex, nullptr) != 0)
 			{
 				m_tlsIndex = s_invalidTlsIndex;
@@ -470,7 +722,7 @@ namespace yatm
 
 #elif YATM_WIN64
 			m_tlsIndex = TlsAlloc();
-#endif // YATM_STD_THREAD
+#endif // YATM_USE_PTHREADS
 
 			YATM_ASSERT(m_tlsIndex != s_invalidTlsIndex);
 		}
@@ -480,30 +732,23 @@ namespace yatm
 		{
 			if (m_tlsIndex != s_invalidTlsIndex)
 			{
-#if YATM_STD_THREAD
-
-#elif YATM_USE_PTHREADS
+#if YATM_USE_PTHREADS
 				pthread_key_delete(m_tlsIndex);
 #elif YATM_WIN64
 				TlsFree(m_tlsIndex);
-#endif // YATM_STD_THREAD
+#endif // YATM_USE_PTHREADS
 			}
 		}
-
-		tls(const tls&) = delete;
-		tls& operator=(const tls&) = delete;
 
 		// -----------------------------------------------------------------------------------------------
 		void set(T* const data)
 		{
 			YATM_ASSERT(m_tlsIndex != s_invalidTlsIndex);
-#if YATM_STD_THREAD
-
-#elif YATM_USE_PTHREADS
+#if YATM_USE_PTHREADS
 			pthread_setspecific(m_tlsIndex, data);
 #elif YATM_WIN64
 			TlsSetValue(m_tlsIndex, data);
-#endif // YATM_STD_THREAD
+#endif // YATM_USE_PTHREADS
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -512,24 +757,20 @@ namespace yatm
 			YATM_ASSERT(m_tlsIndex != s_invalidTlsIndex);
 
 			T* data = nullptr;
-#if YATM_STD_THREAD
-
-#elif YATM_USE_PTHREADS
+#if YATM_USE_PTHREADS
 			data = static_cast<T* const>(pthread_getspecific(m_tlsIndex));
 #elif YATM_WIN64			
 			data = static_cast<T* const>(TlsGetValue(m_tlsIndex));
-#endif // YATM_STD_THREAD
+#endif // YATM_USE_PTHREADS
 			return data;
 		}
 
 	private:
-#if YATM_STD_THREAD
-
-#elif YATM_USE_PTHREADS
+#if YATM_USE_PTHREADS
 		uint32_t m_tlsIndex;
 #elif YATM_WIN64
 		DWORD m_tlsIndex;
-#endif // YATM_STD_THREAD
+#endif // YATM_USE_PTHREADS
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -549,7 +790,7 @@ namespace yatm
 		void*		m_data;
 		counter*	m_counter;
 		job*		m_parent;
-		uint32_t	m_workerMask;
+		uint64_t	m_workerMask;
 		counter		m_pendingJobs;
 		uint32_t    m_flags;
 	};
@@ -557,13 +798,14 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	// A representation of an OS thread.
 	// -----------------------------------------------------------------------------------------------
-	class thread
+	class thread : public no_copy_no_move
 	{
 		typedef void(*ThreadEntryPoint)(void*);
 	public:
 		// -----------------------------------------------------------------------------------------------
 		thread()
 			:
+			m_threadId(0),
 			m_stackSizeInBytes(0),
 			m_index(0)
 #if YATM_WIN64
@@ -579,7 +821,7 @@ namespace yatm
 #if YATM_WIN64
 			if (m_handle != nullptr)
 			{
-				TerminateThread(m_handle, 0u);
+				CloseHandle(m_handle);
 			}
 #elif YATM_USE_PTHREADS
 			pthread_exit(nullptr);
@@ -587,21 +829,39 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		thread(const thread&) = delete;
-		thread& operator=(const thread&) = delete;
-
-		// -----------------------------------------------------------------------------------------------
-		void create(uint32_t _index, size_t _stackSizeInBytes, ThreadEntryPoint _function, void* const _data)
+		void create(uint32_t _index, uint32_t _stackSizeInBytes, ThreadEntryPoint _function, void* const _data, thread_priority _priority = thread_priority::normal)
 		{
 			m_index = _index;
 			m_stackSizeInBytes = _stackSizeInBytes;
 
-#if YATM_STD_THREAD
-			m_thread = std::thread(_function, _data);
-			m_threadId = m_thread.get_id();
-#elif YATM_WIN64
+#if YATM_WIN64
+			int32_t win32Priority = THREAD_PRIORITY_NORMAL;
+			switch (_priority)
+			{
+			case thread_priority::lowest:
+				win32Priority = THREAD_PRIORITY_LOWEST;
+				break;
+			case thread_priority::below_normal:
+				win32Priority = THREAD_PRIORITY_BELOW_NORMAL;
+				break;			
+			case thread_priority::above_normal:
+				win32Priority = THREAD_PRIORITY_ABOVE_NORMAL;
+				break;
+			case thread_priority::highest:
+				win32Priority = THREAD_PRIORITY_HIGHEST;
+				break;
+			case thread_priority::time_critical:
+				win32Priority = THREAD_PRIORITY_TIME_CRITICAL;
+				break;
+			default: break;
+			}
+
 			m_handle = CreateThread(nullptr, m_stackSizeInBytes, (LPTHREAD_START_ROUTINE)_function, _data, 0, &m_threadId);
 			YATM_ASSERT(m_handle != nullptr);
+			
+			BOOL const success = SetThreadPriority(m_handle, win32Priority);
+			YATM_ASSERT(success);
+
 #elif YATM_USE_PTHREADS
             pthread_attr_t attr;
             pthread_attr_init(&attr);
@@ -614,20 +874,17 @@ namespace yatm
 			m_threadId = (uint32_t)m_thread.thread;
 
 			pthread_attr_destroy(&attr);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		void join()
 		{
-#if YATM_STD_THREAD
-			YATM_ASSERT(m_thread.joinable());
-			m_thread.join();
-#elif YATM_WIN64
+#if YATM_WIN64
 			WaitForSingleObject(m_handle, INFINITE);
 #elif YATM_USE_PTHREADS
 			pthread_join(m_thread, nullptr);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -638,39 +895,29 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Get the OS thread index.
 		// -----------------------------------------------------------------------------------------------
-		size_t get_id() const
+		uint32_t get_id() const
 		{
-#if YATM_STD_THREAD
-	#if YATM_DEBUG
-			std::hash<std::thread::id> h;
-			uint32_t const index = h(m_thread.get_id());
-			YATM_ASSERT(h == m_threadId);
-	#endif // YATM_DEBUG
-			return m_threadId;
-#elif YATM_WIN64
+#if YATM_WIN64
 	#if YATM_DEBUG
 			DWORD h = GetThreadId(m_handle);
 			YATM_ASSERT(h == m_threadId);
 	#endif // YATM_DEBUG
-			return (size_t)m_threadId;
-#elif YATM_LINUX || YATM_APPLE
+			return (uint32_t)m_threadId;
+#elif YATM_NIX || YATM_APPLE
 			return m_threadId;
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 	private:
-#if YATM_STD_THREAD
-		std::thread m_thread;
-		uint32_t    m_threadId;
-#elif YATM_WIN64
+#if YATM_WIN64
 		HANDLE		m_handle;
 		DWORD		m_threadId;
 #elif YATM_USE_PTHREADS
-		pthread_t m_thread;
-		uint32_t  m_threadId;
-#endif // YATM_STD_THREAD
+		pthread_t   m_thread;
+		uin64_t     m_threadId;
+#endif // YATM_WIN64
 
-		size_t		m_stackSizeInBytes;
+		uint32_t	m_stackSizeInBytes;
 		uint32_t	m_index;
 	};
 
@@ -679,29 +926,21 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	struct scheduler_desc
 	{
-		uint32_t*	m_threadIds;																		// Thread IDs, used to bind jobs to group of threads. Size must match m_numThreads and is initialised to defaults if not specified.
-		uint32_t	m_numThreads;																		// How many threads to use.
-		uint32_t	m_stackSizeInBytes = YATM_DEFAULT_STACK_SIZE;										// Stack size in bytes of each thread (unsupported in YATM_STD_THREAD).
-		uint32_t	m_jobScratchBufferInBytes = YATM_DEFAULT_JOB_SCRATCH_BUFFER_SIZE;					// Size in bytes of the internal scratch allocator. This is used to allocate jobs and job data.
-		uint32_t	m_jobQueueReservation = YATM_DEFAULT_JOB_QUEUE_RESERVATION;							// How many jobs to reserve in the job vector.
-		uint32_t	m_pendingJobQueueReservation = YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION;			// How many jobs to reserve in the pending job vector (jobs waiting to be kicked).
+		thread_priority* m_priorities;																		// Per thread priorities, the array must be the same size as m_numThreads.
+		uint32_t		 m_numThreads;																		// How many threads to use.
+		uint32_t		 m_stackSizeInBytes = YATM_DEFAULT_STACK_SIZE;										// Stack size in bytes of each thread.
+		uint32_t		 m_jobQueueReservation = YATM_DEFAULT_JOB_QUEUE_RESERVATION;						// How many jobs to reserve in the job vector.
+		uint32_t		 m_pendingJobQueueReservation = YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION;			// How many jobs to reserve in the pending job vector (jobs waiting to be kicked).
 	};
 	
 	// -----------------------------------------------------------------------------------------------
 	// A queue containing jobs to be processed.
 	// -----------------------------------------------------------------------------------------------
-	class job_queue
+	class job_queue : public no_copy_no_move
 	{
 	public:
-		job_queue()
-		{
-		}
-
-		~job_queue() 
-		{
-			m_queue.clear();
-		}
-
+		job_queue() = default;
+		
 		// -----------------------------------------------------------------------------------------------
 		// Lock this queue mutex.
 		// -----------------------------------------------------------------------------------------------
@@ -735,6 +974,46 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Notify the condition variable (all threads)
+		// -----------------------------------------------------------------------------------------------
+		void notify_all()
+		{
+			m_cv.notify_all();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Set the running state for this queue.
+		// -----------------------------------------------------------------------------------------------
+		void set_running(bool _running)
+		{
+			m_isRunning = _running;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the running state for this queue.
+		// -----------------------------------------------------------------------------------------------
+		bool is_running() const
+		{
+			return m_isRunning;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Set the paused state for this queue.
+		// -----------------------------------------------------------------------------------------------
+		void set_paused(bool _paused)
+		{
+			m_isPaused = _paused;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the paused state for this queue.
+		// -----------------------------------------------------------------------------------------------
+		bool is_paused() const
+		{
+			return m_isPaused;
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Reserve N jobs for this queue.
 		// -----------------------------------------------------------------------------------------------
 		void reserve(size_t _size)
@@ -745,7 +1024,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Get the job at the specified index and remove it from the queue.
 		// -----------------------------------------------------------------------------------------------
-		job* const get_job(uint32_t _index)
+		job* const get_job(size_t _index)
 		{
 			YATM_ASSERT(_index < size());
 			job* const j = m_queue[_index];
@@ -756,12 +1035,12 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Get the job at the specified index and remove it from the queue. Similar to get_job, but this time the workerMask is checked against the desired worker index.
 		// -----------------------------------------------------------------------------------------------
-		job* const get_job(uint32_t _index, uint32_t _workerIndex)
+		job* const get_job(size_t _index, uint64_t _workerIndex)
 		{
 			YATM_ASSERT(_index < size());
 			job* const j = m_queue[_index];
 
-			if ( (j->m_workerMask & (1u << _workerIndex)) != 0)
+			if ( (j->m_workerMask & (1ull << _workerIndex)) != 0)
 			{
 				m_queue.erase(m_queue.begin() + _index);
 				return j;
@@ -773,7 +1052,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Get the job at the specified index, but do not remove it from the queue.
 		// -----------------------------------------------------------------------------------------------
-		job* const peek_job(uint32_t _index) const
+		job* const peek_job(size_t _index) const
 		{
 			YATM_ASSERT(_index < size());
 			return m_queue[_index];
@@ -790,39 +1069,41 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Perform work stealing from candidate queues.
 		// -----------------------------------------------------------------------------------------------
-		void steal(job_queue* _candidates, uint32_t _size)
+		void steal(job_queue* _candidates, uint64_t _size)
 		{
 #if YATM_ENABLE_WORK_STEALING
 			// If the queue job count is 0, then we can attempt to steal from another queue.
 			if (empty())
 			{
-				for (uint32_t i = 0; i < _size; ++i)
+				for (auto i = 0; i < _size; ++i)
 				{
 					job_queue& otherQueue = _candidates[i];
 
-					// Skip empty queues and same index
-					if ((&otherQueue == this) || (_candidates[i].empty()))
+					// Skip same queue.
+					if (&otherQueue == this)
 					{
 						continue;
 					}
 
 					// Find a compatible job for this queue.
-					otherQueue.lock();					
-					job* stolen_job = nullptr;
-					uint32_t jobIndex = 0u;
-					if (!otherQueue.empty())
+					if (otherQueue.try_lock())
 					{
-						do
+						job* stolen_job = nullptr;
+						uint64_t jobIndex = 0ull;
+						if (!otherQueue.empty())
 						{
-							stolen_job = otherQueue.get_job(jobIndex, i);
-						} while ((stolen_job == nullptr) && (jobIndex++ < otherQueue.size()));
-					}
-					otherQueue.unlock();
+							do
+							{
+								stolen_job = otherQueue.get_job(jobIndex, i);
+							} while ((stolen_job == nullptr) && (jobIndex++ < otherQueue.size()));
+						}
+						otherQueue.unlock();
 
-					if (stolen_job != nullptr)
-					{
-						push_back(stolen_job);
-						break;
+						if (stolen_job != nullptr)
+						{
+							push_back(stolen_job);
+							break;
+						}
 					}
 				}
 			}
@@ -858,12 +1139,15 @@ namespace yatm
 		std::vector<job*> m_queue;
 		mutex m_mutex;
 		condition_var m_cv;
+
+		bool m_isRunning = false;
+		bool m_isPaused = false;
 	};
 
 	// -----------------------------------------------------------------------------------------------
 	// The task scheduler, used to dispatch tasks for consumption by the worker threads.
 	// -----------------------------------------------------------------------------------------------
-	class scheduler
+	class scheduler : public no_copy_no_move
 	{
 	private:
 		// -----------------------------------------------------------------------------------------------
@@ -910,32 +1194,30 @@ namespace yatm
 				{
 					_queue.lock();
 					_queue.push_back(_job);
-					_queue.unlock();
+					_queue.notify();
+					_queue.unlock();					
 				}
 			}
-			else
-			{
-				// No jobs, simply yield.
-				yield();
-			}
+			
+			yield();
 			return isJobFinished;
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Get the next available compatible job and remove it from the queue.
 		// -----------------------------------------------------------------------------------------------
-		job* get_next_job(uint32_t _index)
+		job* get_next_job(uint64_t _index)
 		{
 			job* current_job = nullptr;
 
 			job_queue& queue = m_queues[_index];
 
 			// Find the next job ready to be processed
-			for (uint32_t i = 0; i < queue.size(); ++i)
+			for (auto i = 0; i < queue.size(); ++i)
 			{
 				job* const j = queue.peek_job(i);
 				// Can this job be processed by this worker thread?
-				if (j->m_workerMask & (1u << _index))
+				if (j->m_workerMask & (1ull << _index))
 				{
 					// This job has 1 remaining task, which means that all its dependencies have been processed.
 					// Pick this task, removing it from the job queue.
@@ -953,23 +1235,27 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Worker entry point; pulls jobs from the global queue and processes them.
 		// -----------------------------------------------------------------------------------------------
-		void worker_entry_point(uint32_t _index)
+		void worker_entry_point(uint64_t _index)
 		{
-			while (m_isRunning)
-			{
-				YATM_ASSERT(_index < m_queueCount);
-				job_queue& queue = m_queues[_index];
+			YATM_ASSERT(_index < m_queueCount);
+			job_queue& queue = m_queues[_index];
+
+			while (queue.is_running())
+			{				
 				job* current_job = nullptr;
 				{
 					queue.lock();
+					{
+						// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
+						queue.wait([this, &queue] { return !queue.is_paused() && ((queue.size() > 0u) || !queue.is_running()); });
 
-					queue.steal(m_queues, m_queueCount);
+						queue.steal(m_queues, m_queueCount);
 
-					// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
-					queue.wait([this, &queue] { return !is_paused() && ((queue.size() > 0u) || !is_running()); });
-					current_job = get_next_job(_index);
+						current_job = get_next_job(_index);						
+					}
 					queue.unlock();
 				}
+
 				worker_internal(current_job, queue);
 			}
 
@@ -981,24 +1267,21 @@ namespace yatm
 	public:
 		// -----------------------------------------------------------------------------------------------
 		scheduler() :
-			m_threads(nullptr), m_scratch(nullptr), m_currentWorkerMaskDepth(0u)
+			m_threads(nullptr)
 		{
-			memset((void*)m_currentWorkerMasks, ~0u, sizeof(uint32_t) * YATM_MAX_WORKER_MASK_STACK_DEPTH);
 
-#if YATM_STD_THREAD
-			m_hwConcurency = std::thread::hardware_concurrency();
-#elif YATM_WIN64
+#if YATM_WIN64
 			SYSTEM_INFO info;
 			ZeroMemory(&info, sizeof(info));
 			GetSystemInfo(&info);
 			m_hwConcurency = info.dwNumberOfProcessors;
-#elif YATM_LINUX || YATM_APPLE
+#elif YATM_NIX || YATM_APPLE
 			m_hwConcurency = sysconf(_SC_NPROCESSORS_CONF);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		virtual ~scheduler()
+		~scheduler()
 		{
 			set_running(false);
 
@@ -1013,16 +1296,9 @@ namespace yatm
 			delete[] m_threads;
 			m_threads = nullptr;
 
-			// free the scratch allocator
-			delete m_scratch;
-			m_scratch = nullptr;
-
 			delete[] m_queues;
+			m_queues = nullptr;
 		}
-
-		// -----------------------------------------------------------------------------------------------
-		scheduler(const scheduler&) = delete;
-		scheduler& operator=(const scheduler&) = delete;
 
 		// -----------------------------------------------------------------------------------------------
 		// Initialise the scheduler.
@@ -1035,22 +1311,15 @@ namespace yatm
 			for (uint32_t i = 0; i < m_numThreads; ++i)
 			{
 				m_threadData[i].m_scheduler = this;
-
-				// Optinally copy custom worker ids (these will be used bitmasks when picking a worker for each job).
-				m_threadData[i].m_id = (_desc.m_threadIds == nullptr) ? i : _desc.m_threadIds[i];
+				m_threadData[i].m_id = i;
 			}
 
 			m_queueCount = m_numThreads;
 			m_queues = new job_queue[m_queueCount];
 
-#if YATM_STD_THREAD
-			YATM_TTY("yatm is using std::thread, configurable stack size is not allowed");
-#endif // YATM_STD_THREAD
-
-			m_stackSizeInBytes = align(_desc.m_stackSizeInBytes > 0 ? _desc.m_stackSizeInBytes : YATM_DEFAULT_STACK_SIZE, 16u);
+			m_stackSizeInBytes = (uint32_t)align(_desc.m_stackSizeInBytes > 0 ? (uint64_t)_desc.m_stackSizeInBytes : YATM_DEFAULT_STACK_SIZE, 16ull);
 
 			m_threads = new thread[m_numThreads];
-			m_scratch = new scratch( align(_desc.m_jobScratchBufferInBytes, 16u), 16u);
 
 			// reserve some space in the global job queue
 			for (uint32_t i = 0; i < m_queueCount; ++i)
@@ -1065,6 +1334,16 @@ namespace yatm
 			set_running(true);
 			set_paused(false);
 
+			thread_priority* priorities = (thread_priority*)YATM_ALLOCA(sizeof(thread_priority) * m_numThreads);
+			if (_desc.m_priorities != nullptr)
+			{
+				memcpy(priorities, _desc.m_priorities, sizeof(thread_priority) * m_numThreads);
+			}
+			else
+			{
+				std::fill(priorities, priorities + m_numThreads, thread_priority::normal);
+			}
+
 			// Create N worker threads and kick them off.
 			// Each worker will process the next available job item from the global queue, resolve its dependencies and carry on until no jobs are left.
 			for (uint32_t i = 0; i < m_numThreads; ++i)
@@ -1075,42 +1354,17 @@ namespace yatm
 					d->m_scheduler->worker_entry_point(d->m_id);
 				};
 
-				m_threads[i].create(i, m_stackSizeInBytes, func, &m_threadData[i]);
+				m_threads[i].create(i, m_stackSizeInBytes, func, &m_threadData[i], priorities[i]);
 			}
+
+			YATM_FREEA(priorities);
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Resets the internal scratch allocator.
-		// -----------------------------------------------------------------------------------------------
-		void reset()
-		{
-			YATM_ASSERT(m_scratch != nullptr);
-			m_scratch->reset();
-		}
-
-		// -----------------------------------------------------------------------------------------------
-		// Push a new worker mask depth, subsequent job allocations will be set to run on the specified workers.
-		// -----------------------------------------------------------------------------------------------
-		void push_worker_mask(uint32_t _workerMask)
-		{
-			YATM_ASSERT(m_currentWorkerMaskDepth < YATM_MAX_WORKER_MASK_STACK_DEPTH);
-			m_currentWorkerMasks[++m_currentWorkerMaskDepth] = _workerMask;
-		}
-
-		// -----------------------------------------------------------------------------------------------
-		// Pop worker mask depth.
-		// -----------------------------------------------------------------------------------------------
-		void pop_worker_mask()
-		{
-			YATM_ASSERT(m_currentWorkerMaskDepth > 0);
-			--m_currentWorkerMaskDepth;
-		}
-
-		// -----------------------------------------------------------------------------------------------
-		// Create a job from the scheduler scratch allocator.
+		// Create a new job.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Function>
-		job* const create_job(const Function& _function, void* const _data, counter* _counter, job::flags _flags = job::JF_None)
+		job* const create_job(const Function& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
 		{
 			job* const j = allocate<job>();
 
@@ -1118,7 +1372,7 @@ namespace yatm
 			j->m_data = _data;
 			j->m_parent = nullptr;
 			j->m_counter = _counter;
-			j->m_workerMask = m_currentWorkerMasks[m_currentWorkerMaskDepth];
+			j->m_workerMask = i_workerMask;
 			j->m_flags = _flags;
 
 			// Initialise the job with 1 pending job (itself).
@@ -1133,7 +1387,7 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Create a group from the scheduler scratch allocator. A group is simply a job without any work to be done, used as a dependency in other
+		// Create a group. A group is simply a job without any work to be done, used as a dependency in other
 		// jobs to create a hierarchy of tasks.
 		// -----------------------------------------------------------------------------------------------
 		job* const create_group(job* const _parent = nullptr)
@@ -1150,25 +1404,23 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Allocate a temporary array using the scheduler scratch allocator.
+		// Allocate memory.
 		// -----------------------------------------------------------------------------------------------
 		template<typename T>
-		T* allocate(size_t _count, size_t _alignment = 16u)
+		T* allocate(uint64_t _count, uint64_t _alignment = 16u)
 		{
-			uint8_t* mem = m_scratch->alloc(sizeof(T) * _count, _alignment);
+			void* const mem = YATM_ALLOC_COUNT(T, _count, _alignment);
 			return new(mem) T[_count];
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Allocate a temporary object using the scheduler scratch allocator.
+		// Allocate memory.
 		// -----------------------------------------------------------------------------------------------
 		template<typename T>
-		T* allocate(size_t _alignment = 16u)
+		T* allocate(uint64_t _alignment = 16u)
 		{
-			uint8_t* mem = m_scratch->alloc(sizeof(T), _alignment);
-
-			T* obj = new(mem) T();
-			return obj;
+			void* const mem = YATM_ALLOC(T, _alignment);
+			return new(mem)T;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1189,7 +1441,7 @@ namespace yatm
 		template<typename Iterator, typename Function>
 		void parallel_for(const Iterator& _begin, const Iterator& _end, const Function& _function)
 		{
-			const size_t n = std::distance(_begin, _end);
+			const auto n = std::distance(_begin, _end);
 			if (n > 0)
 			{
 				// When there is only 1 job, don't pass it through the scheduler.
@@ -1200,7 +1452,7 @@ namespace yatm
 				else
 				{
 					counter jobs_done;
-					for (uint32_t i = 0; i < n; ++i)
+					for (auto i = 0; i < n; ++i)
 					{
 						job* j = create_job(_function, &(*(_begin + i)), &jobs_done);
 					}
@@ -1216,11 +1468,11 @@ namespace yatm
 		// Blocks until all are complete.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Function>
-		void parallel_for(uint32_t _begin, uint32_t _end, const Function& _function)
+		void parallel_for(uint64_t _begin, uint64_t _end, const Function& _function)
 		{
 			YATM_ASSERT(_end > _begin);
 
-			const size_t n = (_end - _begin);
+			const auto n = (_end - _begin);
 			if (n > 0)
 			{
 				// When there is only 1 job, don't pass it through the scheduler.
@@ -1231,7 +1483,7 @@ namespace yatm
 				else
 				{
 					counter jobs_done;
-					for (uint32_t i = 0; i < n; ++i)
+					for (auto i = 0; i < n; ++i)
 					{
 						job* j = create_job(_function, (void* const)(_begin + i), &jobs_done);
 					}
@@ -1250,16 +1502,8 @@ namespace yatm
 			// Add the pending jobs to the global job queue and notify the worker threads that work has been added.
 			{
 				scoped_lock<mutex> lock(&m_pendingJobsMutex);
-
-#if YATM_DEBUG
-				verify_job_graph();
-#endif // YATM_DEBUG
-
 				for (auto& job : m_pendingJobsToAdd)
 				{
-					// Verify that the job and its data is allocated from scratch buffer.
-					YATM_ASSERT(m_scratch->is_from(job));
-
 					add_job(job);
 				}
 				m_pendingJobsToAdd.clear();
@@ -1276,7 +1520,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void process_single_job()
 		{			
-			uint32_t const index = get_random_queue_index();
+			auto const index = random(0u, m_queueCount);
 
 			// Find compatible job to process
 			if (m_queues[index].try_lock())
@@ -1319,16 +1563,14 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		uint32_t get_current_thread_id() const
 		{
-#if YATM_STD_THREAD
-			return std::this_thread::get_id();
-#elif YATM_WIN64
+#if YATM_WIN64
 			return GetCurrentThreadId();
 #elif YATM_USE_PTHREADS
 			pthread_id_np_t tid;
 			pthread_t const self = pthread_self();
 			pthread_getunique_np(&self, &tid);
 			return tid;
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1336,15 +1578,13 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void yield()
 		{
-#if YATM_STD_THREAD
-			std::this_thread::yield();
-#elif YATM_WIN64
+#if YATM_WIN64
 			SwitchToThread();
-#elif YATM_LINUX
+#elif YATM_NIX
 			pthread_yield();
 #elif YATM_APPLE
 			sched_yield();
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1365,7 +1605,10 @@ namespace yatm
 			m_isRunning = _running;
 			for (uint32_t i = 0; i < m_queueCount; ++i)
 			{
+				m_queues[i].lock();
+				m_queues[i].set_running(_running);
 				m_queues[i].notify();
+				m_queues[i].unlock();
 			}
 		}
 
@@ -1382,7 +1625,10 @@ namespace yatm
 			m_isPaused = _paused;
 			for (uint32_t i = 0; i < m_queueCount; ++i)
 			{
+				m_queues[i].lock();
+				m_queues[i].set_paused(_paused);
 				m_queues[i].notify();
+				m_queues[i].unlock();
 			}
 		}
 
@@ -1391,13 +1637,11 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void sleep(uint32_t ms)
 		{
-#if YATM_STD_THREAD
-			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-#elif YATM_WIN64
+#if YATM_WIN64
 			Sleep(ms);
-#elif YATM_LINUX || YATM_APPLE
+#elif YATM_NIX || YATM_APPLE
 			usleep(ms * 1000);
-#endif // YATM_STD_THREAD
+#endif // YATM_WIN64
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1414,10 +1658,8 @@ namespace yatm
 
 	private:		
 		mutex					m_pendingJobsMutex;
-		size_t					m_stackSizeInBytes;
+		uint32_t				m_stackSizeInBytes;
 		uint32_t				m_hwConcurency;
-		uint32_t				m_currentWorkerMasks[YATM_MAX_WORKER_MASK_STACK_DEPTH];
-		uint32_t				m_currentWorkerMaskDepth;
 		uint32_t				m_numThreads;
 		uint32_t				m_queueCount;
 		worker_thread_data*		m_threadData;
@@ -1427,47 +1669,43 @@ namespace yatm
 		job_queue*				m_queues;
 		std::vector<job*>		m_pendingJobsToAdd;
 
-#if YATM_DEBUG
 		// -----------------------------------------------------------------------------------------------
-		// Verify the job graph.
-		// -----------------------------------------------------------------------------------------------
-		void verify_job_graph()
-		{
-
-		}
-#endif // YATM_DEBUG
-
-		// -----------------------------------------------------------------------------------------------
-		// Get a random queue index
-		// -----------------------------------------------------------------------------------------------
-		uint32_t get_random_queue_index() const
-		{
-			uint32_t const index = std::rand() % m_queueCount;
-			return index;
-		}
-
-		// -----------------------------------------------------------------------------------------------
-		// Get a random queue.
-		// -----------------------------------------------------------------------------------------------
-		job_queue& get_random_queue()
-		{
-			uint32_t const index = get_random_queue_index();
-			return m_queues[index];
-		}
-
-		// -----------------------------------------------------------------------------------------------
-		// Adds a single job item to the scheduler. Assumes the caller ensures thread safety.
+		// Adds a single job item to a scheduler's compatible queue (eg. one that matches the worker mask of the job). Assumes the caller ensures thread safety.
 		// -----------------------------------------------------------------------------------------------
 		void add_job(job* const _job)
 		{
 			YATM_ASSERT(_job != nullptr);
 
-			if (_job->m_counter != nullptr)
+			// Find a random compatible queue for the job's worker mask.
+			job_queue** queues = (job_queue**)YATM_ALLOCA(sizeof(job_queue*) * m_queueCount);
+			uint32_t compatibleQueueCount = 0u;
+			for (uint32_t i = 0; i < m_queueCount; ++i)
 			{
-				_job->m_counter->increment();
+				auto& queue = m_queues[i];
+				if (_job->m_workerMask & (1ull << i))
+				{
+					queues[compatibleQueueCount++] = &queue;
+				}
 			}
 
-			get_random_queue().push_back(_job);
+			YATM_ASSERT(compatibleQueueCount != 0);
+
+			if (compatibleQueueCount > 0)
+			{
+				uint32_t const index = random(0u, compatibleQueueCount);
+				auto* queue = queues[index];
+
+				if (_job->m_counter != nullptr)
+				{
+					_job->m_counter->increment();
+				}
+
+				queue->lock();
+				queue->push_back(_job);
+				queue->unlock();
+			}
+
+			YATM_FREEA(queues);
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1477,135 +1715,14 @@ namespace yatm
 		{
 			if (_job != nullptr)
 			{
-				const uint32_t p = _job->m_pendingJobs.decrement();
 				// If this job has finished, inform its parent.
-				if (p == 0)
+				if (_job->m_pendingJobs.decrement() == 0)
 				{
 					finish_job(_job->m_parent);
 				}
+
+				YATM_FREE(_job);
 			}
 		}
-
-		// -----------------------------------------------------------------------------------------------
-		// A scratch allocator to handle data and job allocations.
-		// -----------------------------------------------------------------------------------------------
-		class scratch
-		{
-		public:
-			// -----------------------------------------------------------------------------------------------
-			scratch(size_t _sizeInBytes, size_t _alignment)
-				: m_sizeInBytes(_sizeInBytes), m_alignment(_alignment), m_begin(nullptr), m_end(nullptr), m_current(nullptr)
-
-			{
-				YATM_ASSERT(is_pow2(m_alignment));
-
-				m_begin = (uint8_t*)aligned_alloc(m_sizeInBytes, m_alignment);
-				YATM_ASSERT(m_begin != nullptr);
-
-				m_end = m_begin + m_sizeInBytes;
-				m_current = m_begin;
-			}
-
-			scratch(const scratch&) = delete;
-			scratch& operator=(const scratch&) = delete;
-
-			// -----------------------------------------------------------------------------------------------
-			~scratch()
-			{
-				if (m_begin != nullptr)
-				{
-					aligned_free(m_begin);
-				}
-			}
-
-			// -----------------------------------------------------------------------------------------------
-			// Reset the scratch current pointer.
-			// -----------------------------------------------------------------------------------------------
-			void reset()
-			{
-				m_current = m_begin;
-			}
-
-			// -----------------------------------------------------------------------------------------------
-			// Return the current (aligned) address of the scratch allocator and increment the pointer.
-			// -----------------------------------------------------------------------------------------------
-			uint8_t* alloc(size_t _size, size_t _align)
-			{
-				YATM_ASSERT(is_pow2(_align));
-
-				scoped_lock<mutex> lock(&m_mutex);
-				m_current = align_ptr(m_current, _align);
-
-				YATM_ASSERT(m_current + _size < m_end);
-				uint8_t* mem = m_current;
-				m_current += _size;
-
-#if YATM_DEBUG
-				memset(mem, 0xbabababa, _size);
-#endif // YATM_DEBUG
-
-				return mem;
-			}
-
-			// -----------------------------------------------------------------------------------------------
-			// Checks if the input pointer is within the scratch allocator's memory boundaries.
-			// -----------------------------------------------------------------------------------------------
-			bool is_from(void* _ptr)
-			{
-				const uint8_t* ptr = reinterpret_cast<const uint8_t*>(_ptr);
-				return (ptr >= m_begin && ptr < m_end);
-			}
-
-		private:
-			mutex		m_mutex;
-			uint8_t*	m_begin;
-			uint8_t*	m_end;
-			uint8_t*	m_current;
-			size_t		m_sizeInBytes;
-			size_t		m_alignment;
-
-			// -----------------------------------------------------------------------------------------------
-			// Checks if the input is a power of two.
-			// -----------------------------------------------------------------------------------------------
-			bool is_pow2(size_t _n)
-			{
-				return (_n & (_n - 1)) == 0;
-			}
-
-		public:
-			// -----------------------------------------------------------------------------------------------
-			// A portable aligned allocation mechanism.
-			//
-			// Thanks to: https://gist.github.com/dblalock/255e76195676daa5cbc57b9b36d1c99a
-			// -----------------------------------------------------------------------------------------------
-
-			// -----------------------------------------------------------------------------------------------
-			void* aligned_alloc(size_t _size, size_t _alignment)
-			{
-				YATM_ASSERT(_alignment < UINT8_MAX);
-
-				// over-allocate using malloc and adjust pointer by the offset needed to align the memory to specified alignment
-				const size_t request_size = _size + _alignment;
-				uint8_t* buf = (uint8_t*)malloc(request_size);
-
-				// figure out how much we should offset our allocation by
-				const size_t remainder = ((size_t)buf) % _alignment;
-				const size_t offset = _alignment - remainder;
-				uint8_t* ret = buf + (uint8_t)offset;
-
-				// store how many extra bytes we allocated in the byte just before the pointer we return
-				*(uint8_t*)(ret - 1) = (uint8_t)offset;
-
-				return ret;
-			}
-
-			// -----------------------------------------------------------------------------------------------
-			void aligned_free(const void* const aligned_ptr)
-			{
-				// find the base allocation by extracting the stored aligned offset and free it
-				uint32_t offset = *(((uint8_t*)aligned_ptr) - 1);
-				free(((uint8_t*)aligned_ptr) - offset);
-			}
-		} *m_scratch;
 	};
 }
