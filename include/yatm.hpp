@@ -33,6 +33,7 @@
 #include <limits.h>
 #include <memory.h>
 #include <random>
+#include <queue>
 
 // Compiler detection
 #ifdef _MSC_VER
@@ -942,6 +943,28 @@ namespace yatm
 		job_queue() = default;
 		
 		// -----------------------------------------------------------------------------------------------
+		// Enqueue a job for defer deletion.
+		// -----------------------------------------------------------------------------------------------
+		void enqueue_free(job* const _job)
+		{
+			m_pendingFree.push(_job);
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Process job free operations.
+		// -----------------------------------------------------------------------------------------------
+		void free_jobs()
+		{
+			while (!m_pendingFree.empty())
+			{
+				job* jobFree = m_pendingFree.front();
+				YATM_FREE(jobFree);
+
+				m_pendingFree.pop();
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Lock this queue mutex.
 		// -----------------------------------------------------------------------------------------------
 		void lock()
@@ -1137,6 +1160,7 @@ namespace yatm
 
 	private:
 		std::vector<job*> m_queue;
+		std::queue<job*>  m_pendingFree;
 		mutex m_mutex;
 		condition_var m_cv;
 
@@ -1187,7 +1211,7 @@ namespace yatm
 					}
 
 					// Finish job, notifying parents recursively.
-					finish_job(_job);
+					finish_job(_job, _queue);
 				}
 				// Job has not finished yet, but we need to re-add it to the queue as it needs to be reprocessed.
 				else if (isRecurring)
@@ -1298,6 +1322,18 @@ namespace yatm
 
 			delete[] m_queues;
 			m_queues = nullptr;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Free any memory allocations that are no longer needed. This needs to be done at the start of the next iteration.
+		// -----------------------------------------------------------------------------------------------
+		void reset()
+		{
+			for (uint32_t i = 0; i < m_queueCount; ++i)
+			{
+				job_queue& queue = m_queues[i];
+				queue.free_jobs();
+			}
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1424,6 +1460,14 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Free previously allocated memory.
+		// -----------------------------------------------------------------------------------------------
+		void free(void* const _ptr)
+		{
+			YATM_FREE(_ptr);
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Adds a job dependency on the specified job.
 		// -----------------------------------------------------------------------------------------------
 		void depend(job* const _target, job* const _dependency)
@@ -1520,7 +1564,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void process_single_job()
 		{			
-			auto const index = random(0u, m_queueCount);
+			auto const index = random(0u, m_queueCount-1);
 
 			// Find compatible job to process
 			if (m_queues[index].try_lock())
@@ -1692,7 +1736,7 @@ namespace yatm
 
 			if (compatibleQueueCount > 0)
 			{
-				uint32_t const index = random(0u, compatibleQueueCount);
+				uint32_t const index = random(0u, compatibleQueueCount-1);
 				auto* queue = queues[index];
 
 				if (_job->m_counter != nullptr)
@@ -1711,17 +1755,19 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Mark this job as finished by decrementing the pendingJobs counter and inform its parents recursively.
 		// -----------------------------------------------------------------------------------------------
-		void finish_job(job* const _job)
+		void finish_job(job* const _job, job_queue& _queue)
 		{
 			if (_job != nullptr)
 			{
-				// If this job has finished, inform its parent.
+				// Job has finished;
 				if (_job->m_pendingJobs.decrement() == 0)
 				{
-					finish_job(_job->m_parent);
-				}
+					// Inform the parent.
+					finish_job(_job->m_parent, _queue);
 
-				YATM_FREE(_job);
+					// And add the job to the queue's deferred memory free queue. This happens on the original thread's queue post-stealing, so there is no need to lock it and is thread safe.
+					_queue.enqueue_free(_job);
+				}
 			}
 		}
 	};

@@ -30,9 +30,10 @@ void sample_parallel_for(yatm::scheduler& sch)
 {
 	while (true)
 	{
-		sch.reset();
 		{
 			yatm::scoped_profiler profiler;
+
+			sch.reset();
 
 			// Setup some data for processing
 			const uint32_t dataLength = 100u;
@@ -43,11 +44,9 @@ void sample_parallel_for(yatm::scheduler& sch)
 				uints[i] = i;
 			}
 
-			sch.push_worker_mask(~0u);
-
 			// Launch them in parallel:
 			// Creates as many tasks as the length of specified data, kicks them and blocks the caller thread until they are finished.
-			sch.parallel_for((uint32_t*)uints, (uint32_t*)uints + dataLength, [](void* const param)
+			sch.parallel_for((uint32_t*)uints, (uint32_t*)uints + dataLength, [](void* const param) -> bool
 			{
 				uint32_t idx = *(uint32_t*)param;
 
@@ -55,10 +54,10 @@ void sample_parallel_for(yatm::scheduler& sch)
 				const auto result = yatm::work(idx);
 
 				char t[64];
-				sprintf_fn(t, "Result for data %u: %ld\n", idx, result);
+				sprintf_fn(t, "Result for data %u: %lld\n", idx, result);
 				std::cout << t;
+				return true;
 			});
-			sch.pop_worker_mask();
 
 			// An alternative way to specify functions, without lambdas.
 			/*

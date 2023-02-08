@@ -21,8 +21,6 @@
 ** OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 ** SOFTWARE.
 */
-#define YATM_STD_THREAD (0u)
-
 #include "../common/sample.hpp"
 
 // -----------------------------------------------------------------------------------------------
@@ -36,12 +34,12 @@ void sample_job_dependencies(yatm::scheduler& sch)
 	float averageMs = 0.0f;
 	while ((iter++ < c_numIterations) || (c_numIterations == ~0u))
 	{
-		sch.reset();
-
 		{
 			yatm::scoped_profiler profiler;
 
 			yatm::counter counter;
+
+			sch.reset();
 
 			// Prepare the job graph
 			// This looks like this:
@@ -71,9 +69,10 @@ void sample_job_dependencies(yatm::scheduler& sch)
 			// Parent task depends on everything else below. This will be executed last.
 			yatm::job* const parent = sch.create_job
 			(
-				[](void* const data)
+				[](void* const data) -> bool
 				{
 					std::cout << "Parent, this should execute after all the groups have finished.\n";
+					return true;
 				}
 				,
 				nullptr,
@@ -86,11 +85,11 @@ void sample_job_dependencies(yatm::scheduler& sch)
 			// Make a few groups to put the children jobs under. Group0 will depend on children [0, N/2-1] and group1 will depend on children [N/2, N]
 			// Group0_job and group1_job will execute once their respective children have finished executing.
 			yatm::job* const group0 = sch.create_group(parent);
-			yatm::job* const group0_job = sch.create_job([](void* const data) { std::cout << "Group 0 job, executing after all child 0 are finished.\n"; }, nullptr, &counter);
+			yatm::job* const group0_job = sch.create_job([](void* const data) -> bool { std::cout << "Group 0 job, executing after all child 0 are finished.\n"; return true; }, nullptr, &counter);
 			sch.depend(group0, group0_job);
 
 			yatm::job* const group1 = sch.create_group(parent);
-			yatm::job* const group1_job = sch.create_job([](void* const data) { std::cout << "Group 1 job, executing after all child 1 are finished.\n"; }, nullptr, &counter);
+			yatm::job* const group1_job = sch.create_job([](void* const data) -> bool { std::cout << "Group 1 job, executing after all child 1 are finished.\n"; return true; }, nullptr, &counter);
 			sch.depend(group1, group1_job);
 
 			// Create child tasks
@@ -99,7 +98,7 @@ void sample_job_dependencies(yatm::scheduler& sch)
 				data[i] = i;
 				yatm::job* const child = sch.create_job
 				(
-					[](void* const data)
+					[](void* const data) -> bool
 					{
 						uint32_t idx = *(uint32_t*)data;
 
@@ -108,9 +107,10 @@ void sample_job_dependencies(yatm::scheduler& sch)
 
 						const uint32_t group = idx < c_numChildTasks / 2 ? 0 : 1;
 						char str[512];
-						sprintf_fn(str, "Child %u (group %u). Children of groups should execute first, result: %ld.\n", idx, group, result);
+						sprintf_fn(str, "Child %u (group %u). Children of groups should execute first, result: %lld.\n", idx, group, result);
 
 						std::cout << str;
+						return true;
 					},
 					&data[i],
 					&counter
@@ -136,6 +136,9 @@ void sample_job_dependencies(yatm::scheduler& sch)
 			//
 			// The counter can also be only added on the parent (instead of all the tasks, as done above).
 			// Since the parent depends on all the other tasks, having the counter only on that single job is enough.
+
+			// Free previous data allocation.
+			sch.free(data);
 		}
 		// Pause for a bit, resume after 1000ms
 		sch.set_paused(true);

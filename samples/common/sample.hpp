@@ -71,8 +71,6 @@ namespace yatm
 			desc.m_numThreads = _scheduler.get_max_threads() - 1u;
 		}
 
-		desc.m_jobScratchBufferInBytes = 4096u * 1024u;
-
 		_scheduler.init(desc);
 	}
 }

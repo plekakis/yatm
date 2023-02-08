@@ -9,16 +9,9 @@ endif()
 add_library(SharedSettings INTERFACE)
 
 # Platform detection
-if (WIN32)
-	set(MACROS "YATM_WIN64=1")
-elseif (UNIX) 
+if (UNIX) 
 	find_package(Threads REQUIRED)
 	target_link_libraries(SharedSettings INTERFACE "-pthread")
-	if (NOT APPLE)
-		set(MACROS "YATM_LINUX=1")
-	else()
-		set(MACROS "YATM_APPLE=1")
-	endif()
 endif()
 
 target_compile_definitions(SharedSettings INTERFACE ${MACROS})
