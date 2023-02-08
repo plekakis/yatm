@@ -1,18 +1,10 @@
 # yatm (yet another task manager)
-A simple to use threaded task manager, supporting either std::thread or native thread libraries.
-Customisable through a series of macros that change the behaviour of the scheduler:
-* YATM_STD_THREAD
-* YATM_WIN64
-* YATM_APPLE
-* YATM_LINUX
-* YATM_DEBUG
-* YATM_TTY
-* and more
+A simple to use threaded task manager, wrapping the native platform API.
 
 # Installation
-Simply include the yatm.hpp in your project. Before using it, certain #defines must be set, the most important ones being:
-* Platform: currently either YATM_STD_THREAD, YATM_WIN64, YATM_LINUX or YATM_APPLE.
+Simply include the yatm.hpp in your project, while optionally defining before it:
 * YATM_DEBUG: 1 for builds that can assert, 0 otherwise 
+* YATM_TTY: functionality for tty output.
 
 ## Example usage 1
 This example shows how to initialise the scheduler and run 10 tasks asynchronously, waiting for their completion.
@@ -96,8 +88,6 @@ sch.kick();
 // Wait for completion on all the 10 tasks added before.
 sch.wait(&counter);
 
-// Reset the internal scratch allocator.
-sch.reset();
 ```
 ## Example usage 3
 This example illustrates parent-child relationships by setting up a dependency between 10 child tasks and 1 parent. The children finish first, then the parent.
@@ -171,7 +161,7 @@ sch.parallel_for(my_array.begin(), my_array.end(), [](void* const param)
 });
 ```
 
-**For more complex examples, please look into Source/yatm_sample.cpp**
+**For more complex examples, please look into yatm/samples/ directory. **
 
 # Bugs/Requests
 Please use the [GitHub issue tracker](https://github.com/alkisbkn/yatm/issues) to submit bugs or request features.
