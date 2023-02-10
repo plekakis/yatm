@@ -235,6 +235,17 @@ namespace yatm
 	};
 
 	// -----------------------------------------------------------------------------------------------
+	// Prevent copy.
+	// -----------------------------------------------------------------------------------------------
+	class no_copy
+	{
+	public:
+		no_copy() = default;
+		no_copy(const no_copy&) = delete;
+		no_copy& operator=(const no_copy&) = delete;
+	};
+
+	// -----------------------------------------------------------------------------------------------
 	// std::bind wrapper, used specifically for the job callbacks.
 	// -----------------------------------------------------------------------------------------------
 	template<typename Fx, typename... Args>
@@ -704,7 +715,7 @@ namespace yatm
 	// A representation of a TLS member.
 	// -----------------------------------------------------------------------------------------------
 	template<class T>
-	class tls : public no_copy_no_move
+	class tls : public no_copy
 	{
 		static uint32_t const s_invalidTlsIndex = 0xffffffff;
 #if YATM_WIN64
@@ -742,7 +753,24 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		void set(T* const data)
+		tls(tls&& other)
+		{
+			*this = std::move(other);
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		tls& operator=(tls&& other) noexcept
+		{
+			if (this != &other)
+			{
+				m_tlsIndex = other.m_tlsIndex;
+				other.m_tlsIndex = s_invalidTlsIndex;
+			}
+			return *this;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		void set(T* const data) const
 		{
 			YATM_ASSERT(m_tlsIndex != s_invalidTlsIndex);
 #if YATM_USE_PTHREADS
