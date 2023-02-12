@@ -53,14 +53,13 @@ sch.wait(&counter);
 ```
 
 ## Example usage 2
-Extending the previous example, we pass in custom data. Job data is usually allocated using the built-in scratch allocator, or on the stack if the scope allows. The code is roughly the same as in the previous example, with the addition of the custom data array.
+Extending the previous example, we pass in custom data. Job data is usually allocated using the built-in allocators, or on the stack if the scope allows. The code is roughly the same as in the previous example, with the addition of the custom data array.
 ```cpp
 yatm::scheduler sch;
 
 // Initialise the scheduler
 yatm::scheduler_desc desc;
 desc.m_numThreads = sch.get_max_threads() - 1u;
-desc.m_jobScratchBufferInBytes = 1024u;
 
 sch.init(desc);
 
