@@ -1,10 +1,19 @@
 # yatm (yet another task manager)
 A simple to use threaded task manager, wrapping the native platform API.
 
+# Features
+* Load balancing using job stealing
+* Job dependencies and chaining
+* Job constraints to certain worker mask (up to 64 workers are currently supported)
+* Parallel-for helper functions
+* Atomic operations on uint32 and uint64 types
+* Manual thread management if needed
+
 # Installation
 Simply include the yatm.hpp in your project, while optionally defining before it:
 * YATM_DEBUG: 1 for builds that can assert, 0 otherwise 
 * YATM_TTY: functionality for tty output.
+* YATM_MALLOC / YATM_FREE: used for specifying custom memory allocation / free functionality (defaults to aligned malloc/free)
 
 ## Example usage 1
 This example shows how to initialise the scheduler and run 10 tasks asynchronously, waiting for their completion.
