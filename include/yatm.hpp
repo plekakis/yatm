@@ -644,7 +644,7 @@ namespace yatm
 	{
 	public:
 		// -----------------------------------------------------------------------------------------------
-		counter() : m_value(0u) { }
+		counter() : m_value(0xffffffff) { }
 
 		// -----------------------------------------------------------------------------------------------
 		counter(const counter&) = delete;
@@ -676,7 +676,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Checks the internal atomic counter for quality.
 		// -----------------------------------------------------------------------------------------------
-		bool is_equal(uint32_t _value)
+		bool is_equal(int32_t _value)
 		{
 			return atomic::interlocked_compare_exchange(&m_value, _value, _value) == _value;
 		}
@@ -684,27 +684,43 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Increment the internal atomic counter and return its value.
 		// -----------------------------------------------------------------------------------------------
-		uint32_t increment()
+		int32_t increment()
 		{
-			YATM_ASSERT(get_current() < std::numeric_limits<uint32_t>::max());
+			YATM_ASSERT(get_current() < std::numeric_limits<int32_t>::max());
 			return atomic::interlocked_increment(&m_value);
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Decrement the internal atomic counter and return its value.
 		// -----------------------------------------------------------------------------------------------
-		uint32_t decrement()
+		int32_t decrement()
 		{
 			YATM_ASSERT(get_current() != 0);
 			return atomic::interlocked_decrement(&m_value);
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Update the value of the internal atomic counter and return its previous value.
+		// -----------------------------------------------------------------------------------------------
+		int32_t set(int32_t v)
+		{
+			return atomic::interlocked_exchange(&m_value, v);
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Returns the current value of the internal atomic counter.
 		// -----------------------------------------------------------------------------------------------
-		uint32_t get_current()
+		int32_t get_current()
 		{
 			return atomic::interlocked_compare_exchange(&m_value, 0, 0);
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Initialise the counter to bring it from its original invalid value to 0, if not previously initialised.
+		// -----------------------------------------------------------------------------------------------
+		void touch()
+		{
+			atomic::interlocked_compare_exchange(&m_value, 0, 0xffffffff);
 		}
 
 	private:
@@ -1441,6 +1457,7 @@ namespace yatm
 
 			// Initialise the job with 1 pending job (itself).
 			// Adding dependencies increments the pending counter, resolving dependencies decrements it.
+			j->m_pendingJobs.touch();
 			j->m_pendingJobs.increment();
 
 			// Register this newly created job; all jobs are automatically added when the scheduler kicks-off the tasks.
@@ -1769,6 +1786,7 @@ namespace yatm
 
 				if (_job->m_counter != nullptr)
 				{
+					_job->m_counter->touch();
 					_job->m_counter->increment();
 				}
 
