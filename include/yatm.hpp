@@ -991,6 +991,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void enqueue_free(job* const _job)
 		{
+			scoped_lock<mutex> lock(&m_mutex);
 			m_pendingFree.push(_job);
 		}
 
@@ -999,6 +1000,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void free_jobs()
 		{
+			scoped_lock<mutex> lock(&m_mutex);
 			while (!m_pendingFree.empty())
 			{
 				job* jobFree = m_pendingFree.front();
