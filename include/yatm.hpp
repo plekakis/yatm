@@ -912,7 +912,15 @@ namespace yatm
 			m_handle = CreateThread(nullptr, m_stackSizeInBytes, (LPTHREAD_START_ROUTINE)_function, _data, 0, &m_threadId);
 			YATM_ASSERT(m_handle != nullptr);
 			
-			BOOL const success = SetThreadPriority(m_handle, win32Priority);
+			BOOL success = SetThreadPriority(m_handle, win32Priority);
+			YATM_ASSERT(success);
+
+			// Update the thread's name.
+			// Requires Windows Server 2016, Windows 10 LTSB 2016 and Windows 10 version 1607
+			// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreaddescription
+			wchar_t name[64];
+			swprintf(name, sizeof(name), L"Worker #%u", _index);
+			success = success && SetThreadDescription(m_handle, name);
 			YATM_ASSERT(success);
 
 #elif YATM_USE_PTHREADS
@@ -923,6 +931,13 @@ namespace yatm
 
 			int32_t const errorCode = pthread_create(&m_thread, &attr, (void*(*)(void*))_function, _data);
 			YATM_ASSERT(errorCode == 0);
+
+			// Cannot currently name threads on Apple OS; needs to be called from the thread function itself.
+			#if !YATM_APPLE
+			char name[64];
+			sprintf(name, "Worker #%u", _index);
+			pthread_setname_np(m_thread.thread, name);
+			#endif // !YATM_APPLE
 
 			m_threadId = (uint32_t)m_thread.thread;
 
