@@ -93,6 +93,10 @@
 	#define YATM_TTY(x) std::cout << (x) << std::endl
 #endif // YATM_TTY
 
+#ifndef YATM_WORKER_SCOPE
+	#define YATM_WORKER_SCOPE(label)
+#endif // YATM_WORKER_SCOPE
+
 #ifndef YATM_DEBUG
 	#ifdef _MSC_VER
 		#define YATM_DEBUG (_DEBUG)
@@ -1334,7 +1338,8 @@ namespace yatm
 			job_queue& queue = m_queues[_index];
 
 			while (queue.is_running())
-			{				
+			{
+				YATM_WORKER_SCOPE("WorkerEntryFunction");
 				job* current_job = nullptr;
 				{
 					queue.lock();
@@ -1532,7 +1537,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Free previously allocated memory.
 		// -----------------------------------------------------------------------------------------------
-		void free(void* const _ptr)
+		void free_alloc(void* const _ptr)
 		{
 			YATM_FREE(_ptr);
 		}
