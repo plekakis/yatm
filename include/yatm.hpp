@@ -66,7 +66,7 @@
 
 // Initial codepath support based on platform
 #if YATM_PLATFORM_WINDOWS
-	#define YATM_WIN64 1
+	#define YATM_WIN64 1	
 #elif YATM_PLATFORM_APPLE
 	#define YATM_APPLE 1
 #elif YATM_PLATFORM_UNIX || YATM_PLATFORM_LINUX
@@ -108,6 +108,7 @@
 	#define WIN32_LEAN_AND_MEAN
 	#include <Windows.h>
 	#define YATM_WIN64_ATOMICS 1
+	#define YATM_USE_RW_LOCKS 1
 #elif YATM_NIX || YATM_APPLE
 	#include <unistd.h>
 	#define YATM_GCC_ATOMICS 1
@@ -455,7 +456,11 @@ namespace yatm
 		mutex()
 		{
 #if YATM_WIN64
+	#if YATM_USE_RW_LOCKS
+			InitializeSRWLock(&m_lock);
+	#else
 			InitializeCriticalSection(&m_cs);
+	#endif // YATM_USE_RW_LOCKS
 #elif YATM_USE_PTHREADS
 			pthread_mutex_init(&m_pmtx, nullptr);
 #endif // YATM_WIN64
@@ -466,7 +471,9 @@ namespace yatm
 		{
 
 #if YATM_WIN64
+	#if !YATM_USE_RW_LOCKS
 			DeleteCriticalSection(&m_cs);
+	#endif // !YATM_USE_RW_LOCKS
 #elif YATM_USE_PTHREADS
 			pthread_mutex_destroy(&m_pmtx);
 #endif // YATM_WIN64
@@ -478,9 +485,30 @@ namespace yatm
 		void lock()
 		{
 #if YATM_WIN64
+	#if YATM_USE_RW_LOCKS
+			AcquireSRWLockExclusive(&m_lock);
+	#else
 			EnterCriticalSection(&m_cs);
+	#endif // YATM_USE_RW_LOCKS
 #elif YATM_USE_PTHREADS
 			int32_t const errorCode = pthread_mutex_lock(&m_pmtx);
+			YATM_ASSERT(errorCode == 0);
+#endif // YATM_WIN64
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Unlock the mutex, giving up ownership.
+		// -----------------------------------------------------------------------------------------------
+		void unlock()
+		{
+#if YATM_WIN64
+#if YATM_USE_RW_LOCKS
+			ReleaseSRWLockExclusive(&m_lock);
+#else
+			LeaveCriticalSection(&m_cs);
+#endif // YATM_USE_RW_LOCKS
+#elif YATM_USE_PTHREADS
+			int32_t const errorCode = pthread_mutex_unlock(&m_pmtx);
 			YATM_ASSERT(errorCode == 0);
 #endif // YATM_WIN64
 		}
@@ -492,7 +520,11 @@ namespace yatm
 		{
 			bool v = false;
 #if YATM_WIN64
+	#if YATM_USE_RW_LOCKS
+			v = TryAcquireSRWLockExclusive(&m_lock);
+	#else
 			v = TryEnterCriticalSection(&m_cs);
+	#endif // YATM_USE_RW_LOCKS
 #elif YATM_USE_PTHREADS
 			v = (pthread_mutex_trylock(&m_pmtx) == 0);
 #endif // YATM_WIN64
@@ -501,69 +533,90 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Unlock the mutex, giving-up ownership.
+		// Lock the mutex (read mode if possible).
 		// -----------------------------------------------------------------------------------------------
-		void unlock()
+		void read_lock()
 		{
-#if YATM_WIN64
-			LeaveCriticalSection(&m_cs);
-#elif YATM_USE_PTHREADS
-			int32_t const errorCode = pthread_mutex_unlock(&m_pmtx);
-			YATM_ASSERT(errorCode == 0);
-#endif // YATM_WIN64
+#if YATM_USE_RW_LOCKS
+	#if YATM_WIN64
+			AcquireSRWLockShared(&m_lock);
+	#endif // YATM_WIN64
+#else
+			lock();
+#endif // YATM_USE_RW_LOCKS
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Try to lock the mutex (read mode if possible), returning true if it did.
+		// -----------------------------------------------------------------------------------------------
+		bool try_read_lock()
+		{
+			bool v = false;
+#if YATM_USE_RW_LOCKS
+	#if YATM_WIN64
+			TryAcquireSRWLockShared(&m_lock);
+	#endif // YATM_WIN64
+#else
+			v = try_lock();
+#endif // YATM_USE_RW_LOCKS
+
+			return v;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Unlock the mutex (read mode if possible).
+		// -----------------------------------------------------------------------------------------------
+		void read_unlock()
+		{
+#if YATM_USE_RW_LOCKS
+	#if YATM_WIN64
+			ReleaseSRWLockShared(&m_lock);
+	#endif // YATM_WIN64
+#else
+			unlock();
+#endif // YATM_USE_RW_LOCKS
 		}
 
 	private:
 #if YATM_WIN64
+	#if YATM_USE_RW_LOCKS
+		SRWLOCK m_lock;
+	#else
 		CRITICAL_SECTION m_cs;
+	#endif
 #elif YATM_USE_PTHREADS
 		pthread_mutex_t m_pmtx;
 #endif // YATM_WIN64
-	};
+	}; 
 
 	// -----------------------------------------------------------------------------------------------
 	// A scoped-lock mechanism for mutexes.
 	// -----------------------------------------------------------------------------------------------
-	template<typename T>
+	template<typename T, bool read_only=false>
 	class scoped_lock : public no_copy_no_move
 	{
 		friend class condition_var;
 	public:
 		// -----------------------------------------------------------------------------------------------
-		scoped_lock(T* _mutex) : m_mutex(_mutex), m_locked(false)
+		scoped_lock(T* _mutex) : m_mutex(_mutex)
 		{
-			lock();
+			if constexpr(read_only)
+				m_mutex->read_lock();
+			else
+				m_mutex->lock();
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		~scoped_lock()
 		{
-			unlock();
-		}
-
-		// -----------------------------------------------------------------------------------------------
-		void lock()
-		{
-			if (!m_locked)
-			{
-				m_mutex->lock();
-			}
-			m_locked = true;
-		}
-
-		// -----------------------------------------------------------------------------------------------
-		void unlock()
-		{
-			if (m_locked)
-			{
+			if constexpr (read_only)
+				m_mutex->read_unlock();
+			else
 				m_mutex->unlock();
-			}
-			m_locked = false;
 		}
 
-	private:
-		bool m_locked;
-		T* m_mutex;
+	private:		
+		T* m_mutex = nullptr;
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -618,12 +671,16 @@ namespace yatm
 		// Wait on this condition variable.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Condition>
-		void wait(mutex& _lock, const Condition& _condition)
+		void wait(mutex& _lock, bool read_only, const Condition& _condition)
 		{
 #if YATM_WIN64
 			while (!_condition())
 			{
+	#if YATM_USE_RW_LOCKS
+				SleepConditionVariableSRW(&m_cv, &_lock.m_lock, INFINITE, read_only ? CONDITION_VARIABLE_LOCKMODE_SHARED : 0);
+	#else
 				SleepConditionVariableCS(&m_cv, &_lock.m_cs, INFINITE);
+	#endif // YATM_USE_RW_LOCKS
 			}
 #elif YATM_USE_PTHREADS
 			while (!_condition())
@@ -1062,6 +1119,30 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Lock this queue mutex (read mode).
+		// -----------------------------------------------------------------------------------------------
+		void read_lock()
+		{
+			m_mutex.read_lock();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Attempt to lock this queue mutex (read mode).
+		// -----------------------------------------------------------------------------------------------
+		bool read_try_lock()
+		{
+			return m_mutex.try_read_lock();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Unlock this queue mutex (read mode).
+		// -----------------------------------------------------------------------------------------------
+		void read_unlock()
+		{
+			m_mutex.read_unlock();
+		}
+
+		// -----------------------------------------------------------------------------------------------
 		// Notify the condition variable.
 		// -----------------------------------------------------------------------------------------------
 		void notify()
@@ -1226,9 +1307,9 @@ namespace yatm
 		// Wait until the condition is fulfilled.
 		// -----------------------------------------------------------------------------------------------
 		template<typename T>
-		void wait(T _predicate)
+		void wait(bool read_only, T _predicate)
 		{
-			m_cv.wait(m_mutex, _predicate);
+			m_cv.wait(m_mutex, read_only, _predicate);
 		}
 
 	private:
@@ -1341,17 +1422,21 @@ namespace yatm
 			{
 				YATM_WORKER_SCOPE("WorkerEntryFunction");
 				job* current_job = nullptr;
-				{
-					queue.lock();
+				{					
 					{
 						// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
-						queue.wait([this, &queue] { return !queue.is_paused() && ((queue.size() > 0u) || !queue.is_running()); });
+						queue.read_lock();
+						queue.wait(true, [this, &queue] { return !queue.is_paused() && ((queue.size() > 0u) || !queue.is_running()); });
+						queue.read_unlock();
+					}
 
+					{
+						queue.lock();
 						queue.steal(m_queues, m_queueCount);
 
-						current_job = get_next_job(_index);						
+						current_job = get_next_job(_index);
+						queue.unlock();
 					}
-					queue.unlock();
 				}
 
 				worker_internal(current_job, queue);
@@ -1573,7 +1658,7 @@ namespace yatm
 					counter jobs_done;
 					for (auto i = 0; i < n; ++i)
 					{
-						job* j = create_job(_function, &(*(_begin + i)), &jobs_done);
+						create_job(_function, &(*(_begin + i)), &jobs_done);
 					}
 
 					kick();
