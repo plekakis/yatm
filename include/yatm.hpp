@@ -535,7 +535,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Lock the mutex (read mode if possible).
 		// -----------------------------------------------------------------------------------------------
-		void read_lock()
+		void lock_shared()
 		{
 #if YATM_USE_RW_LOCKS
 	#if YATM_WIN64
@@ -549,7 +549,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Try to lock the mutex (read mode if possible), returning true if it did.
 		// -----------------------------------------------------------------------------------------------
-		bool try_read_lock()
+		bool try_lock_shared()
 		{
 			bool v = false;
 #if YATM_USE_RW_LOCKS
@@ -566,7 +566,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Unlock the mutex (read mode if possible).
 		// -----------------------------------------------------------------------------------------------
-		void read_unlock()
+		void unlock_shared()
 		{
 #if YATM_USE_RW_LOCKS
 	#if YATM_WIN64
@@ -593,29 +593,40 @@ namespace yatm
 	// A scoped-lock mechanism for mutexes.
 	// -----------------------------------------------------------------------------------------------
 	template<typename T, bool read_only=false>
-	class scoped_lock : public no_copy_no_move
+	class scoped_lock : public no_copy
 	{
 		friend class condition_var;
 	public:
 		// -----------------------------------------------------------------------------------------------
 		scoped_lock(T* _mutex) : m_mutex(_mutex)
 		{
-			if constexpr(read_only)
-				m_mutex->read_lock();
-			else
-				m_mutex->lock();
+			lock();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		scoped_lock(T& _mutex) : m_mutex(&_mutex)
+		{
+			lock();
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		~scoped_lock()
 		{
 			if constexpr (read_only)
-				m_mutex->read_unlock();
+				m_mutex->unlock_shared();
 			else
 				m_mutex->unlock();
 		}
 
-	private:		
+	private:
+		void lock()
+		{
+			if constexpr (read_only)
+				m_mutex->lock_shared();
+			else
+				m_mutex->lock();
+		}
+
 		T* m_mutex = nullptr;
 	};
 
@@ -1121,25 +1132,25 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Lock this queue mutex (read mode).
 		// -----------------------------------------------------------------------------------------------
-		void read_lock()
+		void lock_shared()
 		{
-			m_mutex.read_lock();
+			m_mutex.lock_shared();
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Attempt to lock this queue mutex (read mode).
 		// -----------------------------------------------------------------------------------------------
-		bool read_try_lock()
+		bool try_lock_shared()
 		{
-			return m_mutex.try_read_lock();
+			return m_mutex.try_lock_shared();
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Unlock this queue mutex (read mode).
 		// -----------------------------------------------------------------------------------------------
-		void read_unlock()
+		void unlock_shared()
 		{
-			m_mutex.read_unlock();
+			m_mutex.unlock_shared();
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1425,9 +1436,9 @@ namespace yatm
 				{					
 					{
 						// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
-						queue.read_lock();
+						queue.lock_shared();
 						queue.wait(true, [this, &queue] { return !queue.is_paused() && ((queue.size() > 0u) || !queue.is_running()); });
-						queue.read_unlock();
+						queue.unlock_shared();
 					}
 
 					{
