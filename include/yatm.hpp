@@ -73,6 +73,14 @@
 	#define YATM_NIX 1
 #endif // YATM_PLATFORM_WINDOWS
 
+#ifndef YATM_MALLOC_INIT
+	#define YATM_MALLOC_INIT
+#endif // YATM_MALLOC_INIT
+
+#ifndef YATM_MALLOC_DEINIT
+	#define YATM_MALLOC_DEINIT
+#endif // YATM_MALLOC_DEINIT
+
 #ifndef YATM_ENABLE_WORK_STEALING
 	#define YATM_ENABLE_WORK_STEALING (1u)
 #endif // YATM_ENABLE_WORK_STEALING
@@ -1429,6 +1437,8 @@ namespace yatm
 			YATM_ASSERT(_index < m_queueCount);
 			job_queue& queue = m_queues[_index];
 
+			YATM_MALLOC_INIT;
+
 			while (queue.is_running())
 			{
 				YATM_WORKER_SCOPE("WorkerEntryFunction");
@@ -1452,6 +1462,8 @@ namespace yatm
 
 				worker_internal(current_job, queue);
 			}
+
+			YATM_MALLOC_DEINIT;
 
 #if YATM_USE_PTHREADS
 			pthread_exit(nullptr);
