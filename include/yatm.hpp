@@ -285,10 +285,6 @@ namespace yatm
 
 	// -----------------------------------------------------------------------------------------------
 	// Interlocked API for atomic operations.
-	// 
-	// Follows the Win32 convention about return values;
-	// - Add, Increment, Decrement: return the post-operation value.
-	// - All the rest: return ther pre-operation value.
 	// -----------------------------------------------------------------------------------------------
 	class atomic : public no_copy_no_move
 	{
@@ -398,6 +394,24 @@ namespace yatm
 			return InterlockedXor64((LONG64 volatile*)_addend, (LONG64)_value);
 #elif YATM_GCC_ATOMICS
 			return __sync_fetch_and_xor_8(_addend, _value);
+#endif
+		}
+
+		static int32_t interlocked_exchange_add(int32_t volatile* _destination, int32_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedExchangeAdd((LONG volatile*)_destination, (LONG)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_fetch_and_add_4(_destination, _value);
+#endif
+		}
+
+		static int64_t interlocked_exchange_add64(int64_t volatile* _destination, int64_t _value)
+		{
+#if YATM_WIN64_ATOMICS
+			return InterlockedExchangeAdd64((LONG64 volatile*)_destination, (LONG64)_value);
+#elif YATM_GCC_ATOMICS
+			return __sync_fetch_and_add_8(_destination, _value);
 #endif
 		}
 
@@ -1582,11 +1596,11 @@ namespace yatm
 		// Create a new job.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Function>
-		job* const create_job(const Function& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
+		job* const create_job(Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
 		{
 			job* const j = allocate<job>();
 
-			j->m_function = _function;
+			j->m_function = std::forward<Function>(_function);
 			j->m_data = _data;
 			j->m_parent = nullptr;
 			j->m_counter = _counter;
@@ -1600,8 +1614,7 @@ namespace yatm
 
 			// Register this newly created job; all jobs are automatically added when the scheduler kicks-off the tasks.
 			scoped_lock<mutex> lock(&m_pendingJobsMutex);
-			m_pendingJobsToAdd.push_back(j);
-
+			m_pendingJobsToAdd.push_back(j);			
 			return j;
 		}
 
@@ -1666,58 +1679,40 @@ namespace yatm
 		// Blocks until all are complete.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Iterator, typename Function>
-		void parallel_for(const Iterator& _begin, const Iterator& _end, const Function& _function)
+		void parallel_for(const Iterator& _begin, const Iterator& _end, Function&& _function, size_t max_jobs = get_max_threads())
 		{
 			const auto n = std::distance(_begin, _end);
-			if (n > 0)
-			{
-				// When there is only 1 job, don't pass it through the scheduler.
-				if (n == 1)
-				{
-					_function(&(*(_begin)));
-				}
-				else
-				{
-					counter jobs_done;
-					for (auto i = 0; i < n; ++i)
-					{
-						create_job(_function, &(*(_begin + i)), &jobs_done);
-					}
+			if (n <= 0) return;
 
-					kick();
-					wait(&jobs_done);
-				}
+			// When there is only 1 job, don't pass it through the scheduler.
+			if (n == 1)
+			{
+				_function(&(*(_begin)));
 			}
-		}
-
-		// -----------------------------------------------------------------------------------------------
-		// Creates a parallel for loop for the specified collection, launching _function per iteration.
-		// Blocks until all are complete.
-		// -----------------------------------------------------------------------------------------------
-		template<typename Function>
-		void parallel_for(uint64_t _begin, uint64_t _end, const Function& _function)
-		{
-			YATM_ASSERT(_end > _begin);
-
-			const auto n = (_end - _begin);
-			if (n > 0)
+			// Otherwise split into chunks and spawn M amount of jobs.
+			else				
 			{
-				// When there is only 1 job, don't pass it through the scheduler.
-				if (n == 1)
-				{
-					_function((void* const)_begin);
-				}
-				else
-				{
-					counter jobs_done;
-					for (auto i = 0; i < n; ++i)
-					{
-						job* j = create_job(_function, (void* const)(_begin + i), &jobs_done);
-					}
+				size_t const m = std::min(static_cast<size_t>(n), max_jobs);
+				size_t const block_size = (n + m - 1) / m;
 
-					kick();
-					wait(&jobs_done);
+				counter jobs_done;
+				for (auto i=0; i<m; ++i)
+				{
+					create_job([=](void* const data)
+					{
+						size_t const start = i * block_size;
+						size_t const end = std::min(start + block_size, static_cast<size_t>(n));
+						
+						for (auto job_index=start; job_index != end; ++job_index)
+						{
+							_function(&(*(_begin + job_index)));
+						}
+						return true;
+					}, nullptr, &jobs_done);										
 				}
+
+				kick();
+				wait(&jobs_done);
 			}
 		}
 
