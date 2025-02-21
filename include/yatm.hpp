@@ -1462,15 +1462,11 @@ namespace yatm
 						// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
 						queue.lock_shared();
 						queue.wait(true, [this, &queue] { return !queue.is_paused() && ((queue.size() > 0u) || !queue.is_running()); });
-						queue.unlock_shared();
-					}
-
-					{
-						queue.lock();
+						
 						queue.steal(m_queues, m_queueCount);
 
 						current_job = get_next_job(_index);
-						queue.unlock();
+						queue.unlock_shared();
 					}
 				}
 
@@ -1693,16 +1689,18 @@ namespace yatm
 			else				
 			{
 				size_t const m = std::min(static_cast<size_t>(n), max_jobs);
-				size_t const block_size = (n + m - 1) / m;
+				size_t const block_size = std::max(static_cast<size_t>(1u), (n + m - 1) / m);
 
 				counter jobs_done;
 				for (auto i=0; i<m; ++i)
 				{
+					size_t const start = i * block_size;
+					size_t const end = std::min(start + block_size, static_cast<size_t>(n));
+					if (start >= n)
+						continue;
+					
 					create_job([=](void* const data)
 					{
-						size_t const start = i * block_size;
-						size_t const end = std::min(start + block_size, static_cast<size_t>(n));
-						
 						for (auto job_index=start; job_index != end; ++job_index)
 						{
 							_function(&(*(_begin + job_index)));
