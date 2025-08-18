@@ -154,6 +154,22 @@
 
 namespace yatm
 {
+	namespace helpers
+	{
+		// -----------------------------------------------------------------------------------------------
+		static uint32_t get_current_thread_id()
+		{
+#if YATM_WIN64
+			return GetCurrentThreadId();
+#elif YATM_USE_PTHREADS
+			pthread_id_np_t tid;
+			pthread_t const self = pthread_self();
+			pthread_getunique_np(&self, &tid);
+			return tid;
+#endif // YATM_WIN64
+		}
+	}
+
 	// -----------------------------------------------------------------------------------------------
 	// A portable aligned allocation mechanism.
 	//
@@ -832,9 +848,15 @@ namespace yatm
 	// -----------------------------------------------------------------------------------------------
 	// A representation of a TLS member.
 	// -----------------------------------------------------------------------------------------------
-	template<class T>
+	template<class T, bool owns_data = false>
 	class tls : public no_copy
 	{
+#if YATM_WIN64
+		using index_type = DWORD;
+#elif YATM_USE_PTHREADS
+		using index_type = uint32_t;
+#endif // YATM_WIN64
+
 		static uint32_t const s_invalidTlsIndex = 0xffffffff;
 #if YATM_WIN64
 		static_assert(s_invalidTlsIndex == TLS_OUT_OF_INDEXES);
@@ -843,7 +865,7 @@ namespace yatm
 	public:
 		// -----------------------------------------------------------------------------------------------
 		tls()
-		{		
+		{
 #if YATM_USE_PTHREADS
 			if (pthread_key_create(&m_tlsIndex, nullptr) != 0)
 			{
@@ -868,6 +890,15 @@ namespace yatm
 				TlsFree(m_tlsIndex);
 #endif // YATM_USE_PTHREADS
 			}
+
+			if constexpr(owns_data)
+			{
+				for_each([&](uint32_t index, T* data)
+				{
+					delete data;
+				});
+				m_registry.clear();
+			}
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -888,7 +919,7 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		void set(T* const data) const
+		void set(T* const data)
 		{
 			YATM_ASSERT(m_tlsIndex != s_invalidTlsIndex);
 #if YATM_USE_PTHREADS
@@ -896,6 +927,15 @@ namespace yatm
 #elif YATM_WIN64
 			TlsSetValue(m_tlsIndex, data);
 #endif // YATM_USE_PTHREADS
+
+			// Update the registry or erase if null.
+			scoped_lock<mutex> lock(&m_registryMutex);
+
+			auto const id = helpers::get_current_thread_id();
+			if (data != nullptr)
+				m_registry[id] = data;
+			else
+				m_registry.erase(id);
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -912,12 +952,29 @@ namespace yatm
 			return data;
 		}
 
+		// -----------------------------------------------------------------------------------------------
+		void clear()
+		{
+			set(nullptr);
+		}
+
+		// Iterate over all registered thread values (single-threaded context)
+		template<class F>
+		void for_each(F&& fn)
+		{
+			scoped_lock<mutex> lock(&m_registryMutex);
+			for (auto& kv : m_registry)
+			{
+				fn(kv.first, kv.second);
+			}
+		}
+
 	private:
-#if YATM_USE_PTHREADS
-		uint32_t m_tlsIndex;
-#elif YATM_WIN64
-		DWORD m_tlsIndex;
-#endif // YATM_USE_PTHREADS
+		index_type m_tlsIndex;
+
+		// registry
+		std::unordered_map<index_type, T*> m_registry;
+		mutex m_registryMutex;
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -1783,14 +1840,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		uint32_t get_current_thread_id() const
 		{
-#if YATM_WIN64
-			return GetCurrentThreadId();
-#elif YATM_USE_PTHREADS
-			pthread_id_np_t tid;
-			pthread_t const self = pthread_self();
-			pthread_getunique_np(&self, &tid);
-			return tid;
-#endif // YATM_WIN64
+			return helpers::get_current_thread_id();
 		}
 
 		// -----------------------------------------------------------------------------------------------
