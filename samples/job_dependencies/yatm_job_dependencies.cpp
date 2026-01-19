@@ -138,7 +138,7 @@ void sample_job_dependencies(yatm::scheduler& sch)
 			// Since the parent depends on all the other tasks, having the counter only on that single job is enough.
 
 			// Free previous data allocation.
-			sch.free(data);
+			sch.free_alloc(data);
 		}
 		// Pause for a bit, resume after 1000ms
 		sch.set_paused(true);

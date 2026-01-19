@@ -34,6 +34,7 @@
 #include <memory.h>
 #include <random>
 #include <queue>
+#include <bit>
 
 // Compiler detection
 #ifdef _MSC_VER
@@ -985,7 +986,8 @@ namespace yatm
 		enum flags
 		{
 			JF_None = 0x0,
-			JF_Recurring = 0x1
+			JF_Recurring = 0x1,
+			JF_ExternalAlloc = 0x2
 		};
 
 		using JobFuncPtr = std::function<bool(void* const)>;
@@ -1241,14 +1243,6 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Notify the condition variable (all threads)
-		// -----------------------------------------------------------------------------------------------
-		void notify_all()
-		{
-			m_cv.notify_all();
-		}
-
-		// -----------------------------------------------------------------------------------------------
 		// Set the running state for this queue.
 		// -----------------------------------------------------------------------------------------------
 		void set_running(bool _running)
@@ -1336,45 +1330,40 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Perform work stealing from candidate queues.
 		// -----------------------------------------------------------------------------------------------
-		void steal(job_queue* _candidates, uint64_t _size)
+		job* const steal(job_queue* _candidates, uint64_t _size)
 		{
-#if YATM_ENABLE_WORK_STEALING
-			// If the queue job count is 0, then we can attempt to steal from another queue.
-			if (empty())
+#if YATM_ENABLE_WORK_STEALING && 0 // Disabled for now until performance / scheduling issues are resolved.
+			for (auto i = 0; i < _size; ++i)
 			{
-				for (auto i = 0; i < _size; ++i)
+				job_queue& otherQueue = _candidates[i];
+
+				// Skip same queue.
+				if (&otherQueue == this)
 				{
-					job_queue& otherQueue = _candidates[i];
+					continue;
+				}
 
-					// Skip same queue.
-					if (&otherQueue == this)
+				// Find a compatible job for this queue.
+				if (otherQueue.try_lock())
+				{
+					job* stolen_job = nullptr;
+					for (uint64_t jobIndex = 0; jobIndex < otherQueue.size(); ++jobIndex)
 					{
-						continue;
-					}
-
-					// Find a compatible job for this queue.
-					if (otherQueue.try_lock())
-					{
-						job* stolen_job = nullptr;
-						uint64_t jobIndex = 0ull;
-						if (!otherQueue.empty())
+						job* stolen = otherQueue.get_job(jobIndex, i);
+						if (stolen)
 						{
-							do
-							{
-								stolen_job = otherQueue.get_job(jobIndex, i);
-							} while ((stolen_job == nullptr) && (jobIndex++ < otherQueue.size()));
-						}
-						otherQueue.unlock();
-
-						if (stolen_job != nullptr)
-						{
-							push_back(stolen_job);
+							stolen_job = stolen;
 							break;
 						}
 					}
+					otherQueue.unlock();
+
+					if (stolen_job != nullptr)
+						return stolen_job;
 				}
 			}
 #endif // YATM_ENABLE_WORK_STEALING
+			return nullptr;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1432,21 +1421,21 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		bool worker_internal(job* _job, job_queue& _queue)
 		{
-			bool isJobFinished = true;
+			bool is_job_finished = true;
 
 			if (_job != nullptr)
 			{
 				// Recurring jobs do not leave the queue until the worker function says so.
-				bool const isRecurring = (_job->m_flags & job::JF_Recurring) != 0;
+				bool const is_recurring = (_job->m_flags & job::JF_Recurring) != 0;
 				
 				// process job
 				if (_job->m_function != nullptr)
 				{
-					isJobFinished = _job->m_function(_job->m_data);
+					is_job_finished = _job->m_function(_job->m_data);
 				}
 
 				// Job has finished.
-				if (isJobFinished || !isRecurring)
+				if (is_job_finished || !is_recurring)
 				{
 					// decrement the counter
 					if (_job->m_counter != nullptr)
@@ -1458,7 +1447,7 @@ namespace yatm
 					finish_job(_job, _queue);
 				}
 				// Job has not finished yet, but we need to re-add it to the queue as it needs to be reprocessed.
-				else if (isRecurring)
+				else if (is_recurring)
 				{
 					_queue.lock();
 					_queue.push_back(_job);
@@ -1468,7 +1457,7 @@ namespace yatm
 			}
 			
 			yield();
-			return isJobFinished;
+			return is_job_finished;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1519,11 +1508,18 @@ namespace yatm
 						// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
 						queue.lock_shared();
 						queue.wait(true, [this, &queue] { return !queue.is_paused() && ((queue.size() > 0u) || !queue.is_running()); });
-						
-						queue.steal(m_queues, m_queueCount);
-
-						current_job = get_next_job(_index);
 						queue.unlock_shared();
+
+						// Try to get a job; if there's no compatible jobs available, look in other queues and try to steal from them.
+						queue.lock();
+						current_job = get_next_job(_index);
+
+						// no jobs left; find a queue to steal one from.
+						if (current_job == nullptr)
+						{
+							current_job = queue.steal(m_queues, m_queueCount);
+						}
+						queue.unlock();
 					}
 				}
 
@@ -1649,25 +1645,43 @@ namespace yatm
 		// Create a new job.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Function>
-		job* const create_job(Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
+		void create_job_manual(job*& _job,  Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
 		{
-			job* const j = allocate<job>();
-
-			j->m_function = std::forward<Function>(_function);
-			j->m_data = _data;
-			j->m_parent = nullptr;
-			j->m_counter = _counter;
-			j->m_workerMask = i_workerMask;
-			j->m_flags = _flags;
+			_job->m_function = std::forward<Function>(_function);
+			_job->m_data = _data;
+			_job->m_parent = nullptr;
+			_job->m_counter = _counter;
+			_job->m_workerMask = i_workerMask;
+			_job->m_flags = _flags;
 
 			// Initialise the job with 1 pending job (itself).
 			// Adding dependencies increments the pending counter, resolving dependencies decrements it.
-			j->m_pendingJobs.touch();
-			j->m_pendingJobs.increment();
+			_job->m_pendingJobs.touch();
+			_job->m_pendingJobs.increment();
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Create a new job.
+		// -----------------------------------------------------------------------------------------------
+		template<typename Function>
+		job* const create_job_manual(Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
+		{
+			job* j = allocate<job>();
+			create_job_manual(j, std::move(_function), _data, _counter, i_workerMask, _flags);
+			return j;
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Create a job and add it to the pending jobs array.
+		// -----------------------------------------------------------------------------------------------
+		template<typename Function>
+		job* const create_job(Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
+		{
+			job* const j = create_job_manual(std::move(_function), _data, _counter, i_workerMask, _flags);
 
 			// Register this newly created job; all jobs are automatically added when the scheduler kicks-off the tasks.
 			scoped_lock<mutex> lock(&m_pendingJobsMutex);
-			m_pendingJobsToAdd.push_back(j);			
+			m_pendingJobsToAdd.push_back(j);
 			return j;
 		}
 
@@ -1732,7 +1746,7 @@ namespace yatm
 		// Blocks until all are complete.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Iterator, typename Function>
-		void parallel_for(const Iterator& _begin, const Iterator& _end, Function&& _function, size_t max_jobs = get_max_threads())
+		void parallel_for(const Iterator& _begin, const Iterator& _end, Function&& _function, uint64_t _workerMask = ~0ull, uint32_t max_jobs = ~0u)
 		{
 			const auto n = std::distance(_begin, _end);
 			if (n <= 0) return;
@@ -1742,32 +1756,71 @@ namespace yatm
 			{
 				_function(&(*(_begin)));
 			}
-			// Otherwise split into chunks and spawn M amount of jobs.
+			// Otherwise split into chunks and spawn M amount of jobs. Pick a block size large enough to schedule the jobs efficiently across the threads and reduce any CPU bubbles.
 			else				
 			{
-				size_t const m = std::min(static_cast<size_t>(n), max_jobs);
-				size_t const block_size = std::max(static_cast<size_t>(1u), (n + m - 1) / m);
+				size_t const max_jobs_actual = std::min(max_jobs, get_max_threads());
+				
+				size_t const m = std::min(static_cast<size_t>(n), max_jobs_actual);
+				size_t const block_size = std::max(static_cast<size_t>(16u), (n + m - 1) / m);
+
+				job* jobs = new job[m];
+
+				uint64_t used_queue_mask = 0;
 
 				counter jobs_done;
-				for (auto i=0; i<m; ++i)
 				{
-					size_t const start = i * block_size;
-					size_t const end = std::min(start + block_size, static_cast<size_t>(n));
-					if (start >= n)
-						continue;
-					
-					create_job([=](void* const data)
+					for (auto i=0; i<m; ++i)
 					{
-						for (auto job_index=start; job_index != end; ++job_index)
+						size_t const start = i * block_size;
+						size_t const end = std::min(start + block_size, static_cast<size_t>(n));
+						if (start >= n)
+							continue;
+
+						auto job = &jobs[i];
+
+						create_job_manual(job, [&, start, end](void* const data)
 						{
-							_function(&(*(_begin + job_index)));
-						}
-						return true;
-					}, nullptr, &jobs_done);										
+							for (auto job_index=start; job_index != end; ++job_index)
+							{
+								_function(&(*(_begin + job_index)));
+							}
+							return true;
+						}, nullptr, &jobs_done, _workerMask, job::JF_ExternalAlloc);
+
+						auto queue_index = add_job(job);
+						used_queue_mask |= (1ull << queue_index);
+					}
+				}
+				{
+					notify(used_queue_mask);
+					wait(&jobs_done);
 				}
 
-				kick();
-				wait(&jobs_done);
+				delete[] jobs;
+				jobs = nullptr;
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Notify the worker threads.
+		// -----------------------------------------------------------------------------------------------
+		void notify(uint64_t _used_mask = ~0ull)
+		{
+			// Notify the queues where the "used_mask" bits are set.
+			uint32_t queue_index = 0;
+			while (_used_mask != 0)
+			{
+				// SKip over any set zero bits
+				auto const zeros = std::countr_zero(_used_mask);
+				queue_index += zeros;
+
+				// Notify the queue at the set bit.
+				m_queues[queue_index].notify();
+
+				// Advance mask and queue index.
+				_used_mask >>= (zeros + 1);
+				queue_index += 1;
 			}
 		}
 
@@ -1777,27 +1830,25 @@ namespace yatm
 		void kick()
 		{
 			// Add the pending jobs to the global job queue and notify the worker threads that work has been added.
+			uint64_t used_queue_mask = 0;
 			{
 				scoped_lock<mutex> lock(&m_pendingJobsMutex);
 				for (auto& job : m_pendingJobsToAdd)
 				{
-					add_job(job);
+					used_queue_mask |= (1ull << add_job(job));
 				}
 				m_pendingJobsToAdd.clear();
 			}
 
-			for (uint32_t i = 0; i < m_queueCount; ++i)
-			{
-				m_queues[i].notify();
-			}
+			notify(used_queue_mask);
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Try to process the job on a compatible worker thread.
 		// -----------------------------------------------------------------------------------------------
 		void process_single_job()
-		{			
-			auto const index = random(0u, m_queueCount-1);
+		{
+			auto const index = get_next_queue_index();
 
 			// Find compatible job to process
 			if (m_queues[index].try_lock())
@@ -1807,7 +1858,10 @@ namespace yatm
 
 				worker_internal(current_job, m_queues[index]);
 			}
-			yield();						
+			else
+			{
+				yield();
+			}
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1825,13 +1879,16 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Wait for a counter to reach 0. In the meantime, try to process one pending job.
 		// -----------------------------------------------------------------------------------------------
-		void wait(counter* const _counter)
+		void wait(counter* const _counter, bool _process_jobs = true)
 		{
 			YATM_ASSERT(_counter != nullptr);
 			while (!_counter->is_done())
 			{
 				// Process jobs while waiting
-				process_single_job();
+				if (_process_jobs)
+					process_single_job();
+				else
+					yield();
 			}
 		}
 
@@ -1926,6 +1983,54 @@ namespace yatm
 			}
 		}
 
+		// -----------------------------------------------------------------------------------------------
+		// Adds a single job item to a scheduler's compatible queue (eg. one that matches the worker mask of the job). Assumes the caller ensures thread safety.
+		// -----------------------------------------------------------------------------------------------
+		uint32_t add_job(job* const job)
+		{
+			YATM_ASSERT(job != nullptr);
+
+			auto const mask = job->m_workerMask;
+			YATM_ASSERT(mask != 0);
+
+			// Round robin across the queues.
+			auto const start = get_next_queue_index();
+
+			job_queue* selected = nullptr;
+			uint32_t selected_index = 0;
+
+			// First pass: from round-robin start
+			for (uint32_t i = 0; i < m_queueCount; ++i)
+			{
+				selected_index = (start + i) % m_queueCount;
+				if (mask & (1ull << selected_index))
+				{
+					selected = &m_queues[selected_index];
+					break;
+				}
+			}
+
+			YATM_ASSERT(selected != nullptr);
+
+			if (job->m_counter)
+			{
+				job->m_counter->touch();
+				job->m_counter->increment();
+			}
+
+			selected->lock();
+			selected->push_back(job);
+			selected->unlock();
+
+			return selected_index;
+		}
+
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the pending jobs mutex.
+		// -----------------------------------------------------------------------------------------------
+		mutex* get_pending_jobs_mutex() { return &m_pendingJobsMutex; }
+
 	private:		
 		mutex					m_pendingJobsMutex;
 		uint32_t				m_stackSizeInBytes;
@@ -1940,43 +2045,12 @@ namespace yatm
 		std::vector<job*>		m_pendingJobsToAdd;
 
 		// -----------------------------------------------------------------------------------------------
-		// Adds a single job item to a scheduler's compatible queue (eg. one that matches the worker mask of the job). Assumes the caller ensures thread safety.
+		// Get the next queue index in a round-robin way.
 		// -----------------------------------------------------------------------------------------------
-		void add_job(job* const _job)
+		uint32_t get_next_queue_index() const
 		{
-			YATM_ASSERT(_job != nullptr);
-
-			// Find a random compatible queue for the job's worker mask.
-			job_queue** queues = (job_queue**)YATM_ALLOCA(sizeof(job_queue*) * m_queueCount);
-			uint32_t compatibleQueueCount = 0u;
-			for (uint32_t i = 0; i < m_queueCount; ++i)
-			{
-				auto& queue = m_queues[i];
-				if (_job->m_workerMask & (1ull << i))
-				{
-					queues[compatibleQueueCount++] = &queue;
-				}
-			}
-
-			YATM_ASSERT(compatibleQueueCount != 0);
-
-			if (compatibleQueueCount > 0)
-			{
-				uint32_t const index = random(0u, compatibleQueueCount-1);
-				auto* queue = queues[index];
-
-				if (_job->m_counter != nullptr)
-				{
-					_job->m_counter->touch();
-					_job->m_counter->increment();
-				}
-
-				queue->lock();
-				queue->push_back(_job);
-				queue->unlock();
-			}
-
-			YATM_FREEA(queues);
+			static int32_t rr{0};
+			return atomic::interlocked_add(&rr, 1) % m_queueCount;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1993,7 +2067,8 @@ namespace yatm
 					finish_job(_job->m_parent, _queue);
 
 					// And add the job to the queue's deferred memory free queue. This happens on the original thread's queue post-stealing, so there is no need to lock it and is thread safe.
-					_queue.enqueue_free(_job);
+					if ( (_job->m_flags & job::JF_ExternalAlloc) == 0)
+						_queue.enqueue_free(_job);
 				}
 			}
 		}

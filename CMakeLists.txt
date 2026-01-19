@@ -15,7 +15,7 @@ if (UNIX)
 endif()
 
 target_compile_definitions(SharedSettings INTERFACE ${MACROS})
-target_compile_features(SharedSettings INTERFACE cxx_std_17)
+target_compile_features(SharedSettings INTERFACE cxx_std_20)
 target_include_directories(SharedSettings INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 add_subdirectory(samples)
