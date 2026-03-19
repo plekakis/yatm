@@ -112,15 +112,27 @@
 	#endif //_MSC_VER
 #endif // YATM_DEBUG
 
+#define YATM_FUTEX_ATOMICS (YATM_PLATFORM_WINDOWS || YATM_PLATFORM_LINUX)
+
 #if YATM_WIN64
 	#define NOMINMAX
 	#define WIN32_LEAN_AND_MEAN
-	#include <Windows.h>
+	#include <windows.h>
 	#define YATM_WIN64_ATOMICS 1
 	#define YATM_USE_RW_LOCKS 1
+
+	#if YATM_FUTEX_ATOMICS && YATM_COMPILER_MSVC
+	#pragma comment(lib, "Synchronization.lib")
+	#endif // YATM_FUTEX_ATOMICS && YATM_COMPILER_MSVC
 #elif YATM_NIX || YATM_APPLE
 	#include <unistd.h>
 	#define YATM_GCC_ATOMICS 1
+
+	#if YATM_PLATFORM_LINUX && YATM_FUTEX_ATOMICS
+	#include <linux/futex.h>
+	#include <sys/syscall.h>
+	#endif // YATM_PLATFORM_LINUX && YATM_FUTEX_ATOMICS
+
 #endif // YATM_WIN64
 
 #define YATM_USE_PTHREADS (YATM_NIX || YATM_APPLE)
@@ -155,22 +167,6 @@
 
 namespace yatm
 {
-	namespace helpers
-	{
-		// -----------------------------------------------------------------------------------------------
-		static uint32_t get_current_thread_id()
-		{
-#if YATM_WIN64
-			return GetCurrentThreadId();
-#elif YATM_USE_PTHREADS
-			pthread_id_np_t tid;
-			pthread_t const self = pthread_self();
-			pthread_getunique_np(&self, &tid);
-			return tid;
-#endif // YATM_WIN64
-		}
-	}
-
 	// -----------------------------------------------------------------------------------------------
 	// A portable aligned allocation mechanism.
 	//
@@ -220,7 +216,7 @@ namespace yatm
 
 #ifndef YATM_FREE
 	#define YATM_FREE(ptr) yatm::default_alloc::aligned_free((ptr))
-#endif // YATM_fREE
+#endif // YATM_FREE
 
 namespace yatm
 {
@@ -721,7 +717,7 @@ namespace yatm
 		// Wait on this condition variable.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Condition>
-		void wait(mutex& _lock, bool read_only, const Condition& _condition)
+		void wait(mutex& _lock, bool read_only, Condition&& _condition)
 		{
 #if YATM_WIN64
 			while (!_condition())
@@ -748,14 +744,130 @@ namespace yatm
 #endif // YATM_WIN64
 	};
 
+	namespace helpers
+	{
+		// -----------------------------------------------------------------------------------------------
+		inline uint32_t get_current_thread_id()
+		{
+			#if YATM_WIN64
+			return GetCurrentThreadId();
+			#elif YATM_USE_PTHREADS
+			pthread_id_np_t tid;
+			pthread_t const self = pthread_self();
+			pthread_getunique_np(&self, &tid);
+			return tid;
+			#endif // YATM_WIN64
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		inline void futex_wait(volatile int32_t* _value)
+		{
+			auto current = atomic::interlocked_compare_exchange(_value, 0, 0);
+
+			#if YATM_WIN64
+			WaitOnAddress(_value, &current, sizeof(current), INFINITE);
+			#elif YATM_PLATFORM_LINUX
+			syscall(SYS_futex,
+					  value,
+					  FUTEX_WAIT,
+					  current,
+					  nullptr,
+					  nullptr,
+					  0);
+			#endif // YATM_WIN64
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		template<typename T>
+		void futex_wait(volatile int32_t* _value, int32_t _expected, T&& _wait_callback)
+		{
+			while (true)
+			{
+				auto current = atomic::interlocked_compare_exchange(_value, 0, 0);
+				if (current == _expected)
+					return;
+
+				_wait_callback();
+
+				#if YATM_WIN64
+				WaitOnAddress(_value, &current, sizeof(current), INFINITE);
+				#elif YATM_PLATFORM_LINUX
+				syscall(SYS_futex,
+					  _value,
+					  FUTEX_WAIT,
+					  current,
+					  nullptr,
+					  nullptr,
+					  0);
+
+				#endif // YATM_WIN64
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		inline void futex_signal_one(volatile int32_t* _value)
+		{
+			#if YATM_WIN64
+			WakeByAddressSingle((void*)_value);
+			#elif YATM_PLATFORM_LINUX
+			int ret = syscall(SYS_futex,
+					      _value,
+					      FUTEX_WAKE,
+					      1,
+					      nullptr,
+					      nullptr,
+					      0);
+			#endif // YATM_WIN64
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		inline void futex_signal_all(volatile int32_t* _value)
+		{
+			#if YATM_WIN64
+			WakeByAddressAll((void*)_value);
+			#elif YATM_PLATFORM_LINUX
+			int ret = syscall(SYS_futex,
+					      _value,
+					      FUTEX_WAKE,
+					      INT_MAX,
+					      nullptr,
+					      nullptr,
+					      0);
+			#endif // YATM_WIN64
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		template<typename T>
+		void cv_wait(volatile int32_t* _value, int32_t _expected, mutex& _mutex, condition_var& _cv, T&& _wait_callback)
+		{
+			while (true)
+			{
+				if (atomic::interlocked_compare_exchange(_value, 0, 0) == _expected)
+					return;
+
+				_wait_callback();
+
+				_mutex.lock_shared();
+				if (atomic::interlocked_compare_exchange(_value, 0, 0) != _expected)
+				{
+					_cv.wait(_mutex, true, [&]{ return atomic::interlocked_compare_exchange(_value, 0, 0) == _expected; });
+				}
+				_mutex.unlock_shared();
+			}
+		}
+	}
+
 	// -----------------------------------------------------------------------------------------------
 	// An atomic counter used for synchronisation.
 	// -----------------------------------------------------------------------------------------------
 	class counter
 	{
 	public:
+		using counter_type = int32_t;
+		static constexpr auto s_counter_max = std::numeric_limits<counter_type>::max();
+
 		// -----------------------------------------------------------------------------------------------
-		counter() : m_value(0xffffffff) { }
+		counter() : m_value(s_counter_max) { }
 
 		// -----------------------------------------------------------------------------------------------
 		counter(const counter&) = delete;
@@ -781,7 +893,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		bool is_untouched()
 		{
-			return is_equal(0xffffffff);
+			return is_equal(s_counter_max);
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -795,7 +907,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Checks the internal atomic counter for quality.
 		// -----------------------------------------------------------------------------------------------
-		bool is_equal(int32_t _value)
+		bool is_equal(counter_type _value)
 		{
 			return atomic::interlocked_compare_exchange(&m_value, _value, _value) == _value;
 		}
@@ -803,25 +915,35 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Increment the internal atomic counter and return its value.
 		// -----------------------------------------------------------------------------------------------
-		int32_t increment()
+		counter_type increment()
 		{
-			YATM_ASSERT(get_current() < std::numeric_limits<int32_t>::max());
+			YATM_ASSERT(get_current() < s_counter_max);
 			return atomic::interlocked_increment(&m_value);
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Decrement the internal atomic counter and return its value.
 		// -----------------------------------------------------------------------------------------------
-		int32_t decrement()
+		counter_type decrement()
 		{
 			YATM_ASSERT(get_current() != 0);
-			return atomic::interlocked_decrement(&m_value);
+
+			auto value = atomic::interlocked_decrement(&m_value);
+			if (value == 0)
+			{
+				#if YATM_FUTEX_ATOMICS
+				helpers::futex_signal_all(&m_value);
+				#else
+				m_cv.notify_all();
+				#endif // YATM_FUTEX_ATOMICS
+			}
+			return value;
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Update the value of the internal atomic counter and return its previous value.
 		// -----------------------------------------------------------------------------------------------
-		int32_t set(int32_t v)
+		counter_type set(counter_type v)
 		{
 			return atomic::interlocked_exchange(&m_value, v);
 		}
@@ -829,7 +951,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Returns the current value of the internal atomic counter.
 		// -----------------------------------------------------------------------------------------------
-		int32_t get_current()
+		counter_type get_current()
 		{
 			return atomic::interlocked_compare_exchange(&m_value, 0, 0);
 		}
@@ -839,11 +961,29 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void touch()
 		{
-			atomic::interlocked_compare_exchange(&m_value, 0, 0xffffffff);
+			atomic::interlocked_compare_exchange(&m_value, 0, s_counter_max);
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Wait on the value to be 0.
+		// -----------------------------------------------------------------------------------------------
+		template<typename T>
+		void wait(T&& _wait_callback)
+		{
+			#if YATM_FUTEX_ATOMICS
+			helpers::futex_wait(&m_value, 0, std::forward<T>(_wait_callback) );
+			#else
+			helpers::cv_wait(&m_value, 0, m_mutex, m_cv, std::forward<T>(_wait_callback) );
+			#endif // YATM_FUTEX_ATOMICS
 		}
 
 	private:
-		YATM_ATOMIC_ALIGN int32_t m_value;
+		YATM_ATOMIC_ALIGN counter_type m_value;
+
+		#if !YATM_FUTEX_ATOMICS
+		condition_var m_cv;
+		mutex m_mutex;
+		#endif // !YATM_FUTEX_ATOMICS
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -1235,11 +1375,16 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Notify the condition variable.
+		// Notify the condition variable or wake up the futex.
 		// -----------------------------------------------------------------------------------------------
 		void notify()
 		{
+			#if YATM_FUTEX_ATOMICS
+			atomic::interlocked_increment(&m_state);
+			helpers::futex_signal_one(&m_state);
+			#else
 			m_cv.notify_one();
+			#endif // YATM_FUTEX_ATOMICS
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1383,19 +1528,33 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Futex version of waiting until the queue has been touched.
+		// -----------------------------------------------------------------------------------------------
+		#if YATM_FUTEX_ATOMICS
+		void wait()
+		{
+			helpers::futex_wait(&m_state);
+		}
+		#else
+		// -----------------------------------------------------------------------------------------------
 		// Wait until the condition is fulfilled.
 		// -----------------------------------------------------------------------------------------------
 		template<typename T>
-		void wait(bool read_only, T _predicate)
+		void wait(bool read_only, T&& _predicate)
 		{
 			m_cv.wait(m_mutex, read_only, _predicate);
 		}
+		#endif // YATM_FUTEX_ATOMICS
 
 	private:
 		std::vector<job*> m_queue;
 		std::queue<job*>  m_pendingFree;
 		mutex m_mutex;
+		#if YATM_FUTEX_ATOMICS
+		YATM_ATOMIC_ALIGN int32_t m_state = 0;
+		#else
 		condition_var m_cv;
+		#endif // YATM_FUTEX_ATOMICS
 
 		bool m_isRunning = false;
 		bool m_isPaused = false;
@@ -1455,8 +1614,7 @@ namespace yatm
 					_queue.unlock();					
 				}
 			}
-			
-			yield();
+
 			return is_job_finished;
 		}
 
@@ -1506,9 +1664,17 @@ namespace yatm
 				{					
 					{
 						// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
+						#if YATM_FUTEX_ATOMICS
+						while(queue.is_paused() || (queue.size() == 0 && queue.is_running()))
+						{
+							queue.wait();
+						}
+
+						#else
 						queue.lock_shared();
 						queue.wait(true, [this, &queue] { return !queue.is_paused() && ((queue.size() > 0u) || !queue.is_running()); });
 						queue.unlock_shared();
+						#endif // YATM_FUTEX_ATOMICS
 
 						// Try to get a job; if there's no compatible jobs available, look in other queues and try to steal from them.
 						queue.lock();
@@ -1524,6 +1690,8 @@ namespace yatm
 				}
 
 				worker_internal(current_job, queue);
+
+				yield();
 			}
 
 			YATM_MALLOC_DEINIT;
@@ -1578,6 +1746,17 @@ namespace yatm
 			{
 				job_queue& queue = m_queues[i];
 				queue.free_jobs();
+			}
+
+			// And free pending external allocations
+			while (!m_pendingExternalJobFree.empty())
+			{
+				job* job = m_pendingExternalJobFree.front();
+				YATM_ASSERT(job != nullptr);
+
+				delete[] job;
+
+				m_pendingExternalJobFree.pop();
 			}
 		}
 
@@ -1637,6 +1816,8 @@ namespace yatm
 
 				m_threads[i].create(i, m_stackSizeInBytes, func, &m_threadData[i], priorities[i]);
 			}
+
+			m_mainThreadId = get_current_thread_id();
 
 			YATM_FREEA(priorities);
 		}
@@ -1748,6 +1929,9 @@ namespace yatm
 		template<typename Iterator, typename Function>
 		void parallel_for(const Iterator& _begin, const Iterator& _end, Function&& _function, uint64_t _workerMask = ~0ull, uint32_t max_jobs = ~0u)
 		{
+			// At the moment it's only callable from the main thread (also m_pendingExternalJobFree operations are not thread safe).
+			YATM_ASSERT(m_mainThreadId == get_current_thread_id());
+
 			const auto n = std::distance(_begin, _end);
 			if (n <= 0) return;
 
@@ -1765,6 +1949,7 @@ namespace yatm
 				size_t const block_size = std::max(static_cast<size_t>(16u), (n + m - 1) / m);
 
 				job* jobs = new job[m];
+				m_pendingExternalJobFree.push(jobs);
 
 				uint64_t used_queue_mask = 0;
 
@@ -1796,9 +1981,6 @@ namespace yatm
 					notify(used_queue_mask);
 					wait(&jobs_done);
 				}
-
-				delete[] jobs;
-				jobs = nullptr;
 			}
 		}
 
@@ -1846,22 +2028,22 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Try to process the job on a compatible worker thread.
 		// -----------------------------------------------------------------------------------------------
-		void process_single_job()
+		bool process_single_job()
 		{
 			auto const index = get_next_queue_index();
+
+			job* current_job = nullptr;
 
 			// Find compatible job to process
 			if (m_queues[index].try_lock())
 			{
-				job* current_job = get_next_job(index);
+				current_job = get_next_job(index);
 				m_queues[index].unlock();
 
 				worker_internal(current_job, m_queues[index]);
 			}
-			else
-			{
-				yield();
-			}
+
+			return current_job != nullptr;
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1870,10 +2052,7 @@ namespace yatm
 		void wait(job* const _job)
 		{
 			YATM_ASSERT(_job != nullptr);
-			while (!_job->m_pendingJobs.is_done())
-			{
-				process_single_job();
-			}
+			_job->m_pendingJobs.wait([&] { process_single_job(); });
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1882,14 +2061,14 @@ namespace yatm
 		void wait(counter* const _counter, bool _process_jobs = true)
 		{
 			YATM_ASSERT(_counter != nullptr);
-			while (!_counter->is_done())
+
+			_counter->wait([&]
 			{
-				// Process jobs while waiting
 				if (_process_jobs)
+				{
 					process_single_job();
-				else
-					yield();
-			}
+				}
+			});
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -2043,6 +2222,8 @@ namespace yatm
 		thread*					m_threads;
 		job_queue*				m_queues;
 		std::vector<job*>		m_pendingJobsToAdd;
+		std::queue<job*>		m_pendingExternalJobFree;
+		uint32_t				m_mainThreadId;
 
 		// -----------------------------------------------------------------------------------------------
 		// Get the next queue index in a round-robin way.
