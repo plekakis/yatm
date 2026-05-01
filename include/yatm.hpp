@@ -29,12 +29,12 @@
 #include <cstdlib>
 #include <cassert>
 #include <functional>
-#include <algorithm>
-#include <limits.h>
+#include <climits>
 #include <memory.h>
 #include <random>
 #include <queue>
 #include <bit>
+#include <chrono>
 
 // Compiler detection
 #ifdef _MSC_VER
@@ -88,7 +88,7 @@
 
 #ifndef YATM_CACHE_LINE_SIZE
 	#define YATM_CACHE_LINE_SIZE (64u)
-#endif // YATM_CACHE_SIZE
+#endif // YATM_CACHE_LINE_SIZE
 
 #ifndef YATM_DEFAULT_STACK_SIZE
 	#define YATM_DEFAULT_STACK_SIZE (1024u * 1024u)
@@ -101,6 +101,10 @@
 #ifndef YATM_TTY
 	#define YATM_TTY(x) std::cout << (x) << std::endl
 #endif // YATM_TTY
+
+#ifndef YATM_HEARTBEAT
+	#define YATM_HEARTBEAT (1)
+#endif // YATM_HEARTBEAT
 
 #ifndef YATM_WORKER_SCOPE
 	#define YATM_WORKER_SCOPE(label)
@@ -125,6 +129,8 @@
 	#pragma comment(lib, "Synchronization.lib")
 	#endif // YATM_FUTEX_ATOMICS && YATM_COMPILER_MSVC
 #elif YATM_NIX || YATM_APPLE
+	#include <sys/types.h>
+	#include <sys/sysctl.h>
 	#include <unistd.h>
 	#define YATM_GCC_ATOMICS 1
 
@@ -165,8 +171,110 @@
 	#define YATM_FREEA(x) 
 #endif
 
+#define YATM_DEBUG_STRINGS YATM_HEARTBEAT
+
 namespace yatm
 {
+	// -----------------------------------------------------------------------------------------------
+	// Time-related helpers
+	// -----------------------------------------------------------------------------------------------
+	class time_helpers
+	{
+	public:
+		using tick_t = int64_t;
+		using tick_duration = std::chrono::nanoseconds;
+
+		static tick_t now_ticks()
+		{
+			using namespace std::chrono;
+			return duration_cast<tick_duration>(steady_clock::now().time_since_epoch()).count();
+		}
+
+		static double ticks_to_seconds(tick_t _ticks)
+		{
+			using namespace std::chrono;
+			return duration<double>(tick_duration(_ticks)).count();
+		}
+
+		static tick_t seconds_to_ticks(double _seconds)
+		{
+			using namespace std::chrono;
+			return duration_cast<tick_duration>(duration<double>(_seconds)).count();
+		}
+	};
+
+	// -----------------------------------------------------------------------------------------------
+	// A simple breakpoint detector. Assumes that the caller thread cannot be blocked, otherwise the timing heuristic would fail and erroneously report breakpoints.
+	// -----------------------------------------------------------------------------------------------
+	class breakpoint_helper
+	{
+	public:
+		breakpoint_helper()
+		{
+			m_ticks = time_helpers::now_ticks();
+		}
+
+		[[nodiscard]] bool detect(double _tolerance)
+		{
+			bool debuggerPresent = false;
+#if YATM_WIN64
+			debuggerPresent = (IsDebuggerPresent() == TRUE);
+#elif YATM_NIX
+			// check if the current running process has a "tracerpid" line and if so, we can assume that the debugger is attached.
+			std::ifstream f("/proc/self/status");
+			std::string line;
+
+			while (std::getline(f, line))
+			{
+				if (line.rfind("TracerPid:", 0) == 0)
+				{
+					debuggerPresent = std::stoi(line.substr(10)) != 0;
+					break;
+				}
+			}
+#elif YATM_APPLE
+			// https://developer.apple.com/library/archive/qa/qa1361/_index.html
+			int                 junk;
+			int                 mib[4];
+			struct kinfo_proc   info;
+			size_t              size;
+
+			// Initialize the flags so that, if sysctl fails for some bizarre
+			// reason, we get a predictable result.
+			info.kp_proc.p_flag = 0;
+
+			// Initialize mib, which tells sysctl the info we want, in this case
+			// we're looking for information about a specific process ID.
+			mib[0] = CTL_KERN;
+			mib[1] = KERN_PROC;
+			mib[2] = KERN_PROC_PID;
+			mib[3] = getpid();
+
+			// Call sysctl.
+			size = sizeof(info);
+			junk = sysctl(mib, sizeof(mib) / sizeof(*mib), &info, &size, NULL, 0);
+			assert(junk == 0);
+
+			// We're being debugged if the P_TRACED flag is set.
+			debuggerPresent = (info.kp_proc.p_flag & P_TRACED) != 0;
+#endif // YATM_WIN64
+			// Simply return false if there's no debugger attached.
+			if (!debuggerPresent)
+				return false;
+
+			auto const nowTicks = time_helpers::now_ticks();
+			auto const ticksDelta = nowTicks - m_ticks;
+			m_ticks = nowTicks;
+
+			return time_helpers::ticks_to_seconds(ticksDelta) > (_tolerance * s_threadJitterTolerance);
+		}
+
+	private:
+		time_helpers::tick_t m_ticks;
+
+		static constexpr double s_threadJitterTolerance = 2.0;
+	};
+
 	// -----------------------------------------------------------------------------------------------
 	// A portable aligned allocation mechanism.
 	//
@@ -182,7 +290,7 @@ namespace yatm
 			YATM_ASSERT(_alignment < UINT8_MAX);
 
 			// over-allocate using malloc and adjust pointer by the offset needed to align the memory to specified alignment
-			const auto request_size = _size + _alignment;
+			auto const request_size = _size + _alignment;
 			uint8_t* buf = (uint8_t*)malloc(request_size);
 
 			// figure out how much we should offset our allocation by
@@ -233,6 +341,18 @@ namespace yatm
 		above_normal,
 		highest,
 		time_critical
+	};
+
+	// -----------------------------------------------------------------------------------------------
+	// Thread state; this refers to whether the thread is idle and waiting for work, or the work has been completed.
+	// -----------------------------------------------------------------------------------------------
+	enum class thread_state : uint8_t
+	{
+		idle,
+		working,
+		waiting_for_job,
+		polling_for_job,
+		waiting_sync
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -1139,6 +1259,9 @@ namespace yatm
 		uint64_t	m_workerMask;
 		counter		m_pendingJobs;
 		uint32_t    m_flags;
+#if YATM_DEBUG_STRINGS
+		char		m_debugName[64];
+#endif // YATM_DEBUG_STRINGS
 	};
 
 	// -----------------------------------------------------------------------------------------------
@@ -1175,10 +1298,12 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		void create(uint32_t _index, uint32_t _stackSizeInBytes, ThreadEntryPoint _function, void* const _data, thread_priority _priority = thread_priority::normal)
+		void create(uint32_t _index, std::string const& _name, uint32_t _stackSizeInBytes, bool _allowHeartbeat, ThreadEntryPoint _function, void* const _data, thread_priority _priority = thread_priority::normal)
 		{
 			m_index = _index;
 			m_stackSizeInBytes = _stackSizeInBytes;
+			m_name = _name;
+			m_allowHeartbeat = _allowHeartbeat;
 
 #if YATM_WIN64
 			int32_t win32Priority = THREAD_PRIORITY_NORMAL;
@@ -1211,9 +1336,7 @@ namespace yatm
 			// Update the thread's name.
 			// Requires Windows Server 2016, Windows 10 LTSB 2016 and Windows 10 version 1607
 			// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreaddescription
-			wchar_t name[64];
-			swprintf(name, sizeof(name), L"Worker #%u", _index);
-			success = success && SetThreadDescription(m_handle, name);
+			success = success && SetThreadDescription(m_handle, std::wstring(m_name.begin(), m_name.end()).c_str());
 			YATM_ASSERT(success);
 
 #elif YATM_USE_PTHREADS
@@ -1227,15 +1350,17 @@ namespace yatm
 
 			// Cannot currently name threads on Apple OS; needs to be called from the thread function itself.
 			#if !YATM_APPLE
-			char name[64];
-			sprintf(name, "Worker #%u", _index);
-			pthread_setname_np(m_thread.thread, name);
+			pthread_setname_np(m_thread.thread, m_name.c_str());
 			#endif // !YATM_APPLE
 
 			m_threadId = (uint32_t)m_thread.thread;
 
 			pthread_attr_destroy(&attr);
 #endif // YATM_WIN64
+
+#if YATM_HEARTBEAT
+			heartbeat();
+#endif // YATM_HEARTBEAT
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1249,9 +1374,29 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Get the thread worker index.
+		// Update the thread's state.
+		// -----------------------------------------------------------------------------------------------
+		void set_state(thread_state _state) { atomic::interlocked_exchange(&m_state, static_cast<int32_t>(_state)); }
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the thread's state.
+		// -----------------------------------------------------------------------------------------------
+		thread_state get_state() { return static_cast<thread_state>(atomic::interlocked_compare_exchange(&m_state, 0, 0)); }
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the thread index.
 		// -----------------------------------------------------------------------------------------------
 		uint32_t get_index() const { return m_index; }
+
+		// -----------------------------------------------------------------------------------------------
+		// Check if this thread allows the heartbeat monitor to check for hangs.
+		// -----------------------------------------------------------------------------------------------
+		bool allow_heartbeat() const { return m_allowHeartbeat; }
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the thread name.
+		// -----------------------------------------------------------------------------------------------
+		std::string const& get_name() const { return m_name; }
 
 		// -----------------------------------------------------------------------------------------------
 		// Get the OS thread index.
@@ -1278,20 +1423,75 @@ namespace yatm
 		uin64_t     m_threadId;
 #endif // YATM_WIN64
 
-		uint32_t	m_stackSizeInBytes;
-		uint32_t	m_index;
+		uint32_t		m_stackSizeInBytes;
+		uint32_t		m_index;
+		bool			m_allowHeartbeat;
+		std::string		m_name;
+
+		YATM_ATOMIC_ALIGN int32_t m_state = 0;
+
+#if YATM_HEARTBEAT
+	public:
+		// -----------------------------------------------------------------------------------------------
+		// Update the running ticks for this thread.
+		// -----------------------------------------------------------------------------------------------
+		void heartbeat(std::string const& _debugName = "")
+		{
+			if (m_allowHeartbeat)
+			{
+				atomic::interlocked_exchange64(&m_heartbeatTick, time_helpers::now_ticks());
+
+				m_debugName = _debugName;
+			}
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the current running ticks for this thread.
+		// -----------------------------------------------------------------------------------------------
+		int64_t get_heartbeat_ticks() { return atomic::interlocked_compare_exchange64(&m_heartbeatTick, 0, 0); }
+
+		// -----------------------------------------------------------------------------------------------
+		// Get the assigned debug name, if any.
+		// -----------------------------------------------------------------------------------------------
+		std::string const& get_debug_name() const { return m_debugName; }
+
+	private:
+		YATM_ATOMIC_ALIGN int64_t m_heartbeatTick = 0;
+		std::string m_debugName;
+#endif // YATM_HEARTBEAT
 	};
+
+	// -----------------------------------------------------------------------------------------------
+	// A description of a hung thread.
+	// -----------------------------------------------------------------------------------------------
+	struct thread_hang_info
+	{
+		thread* m_thread = nullptr;		// The thread in question.
+		double	m_seconds = 0.0;		// How long it was hung for, in seconds.
+	};
+
+	using thread_hang_func = std::function<void(std::vector<thread_hang_info>)>;
 
 	// -----------------------------------------------------------------------------------------------
 	// A description for the scheduler to create the worker threads.
 	// -----------------------------------------------------------------------------------------------
 	struct scheduler_desc
 	{
-		thread_priority* m_priorities;																		// Per thread priorities, the array must be the same size as m_numThreads.
+		thread_priority* m_priorities = nullptr;															// Per thread priorities, the array must be the same size as m_numThreads.
 		uint32_t		 m_numThreads;																		// How many threads to use.
 		uint32_t		 m_stackSizeInBytes = YATM_DEFAULT_STACK_SIZE;										// Stack size in bytes of each thread.
 		uint32_t		 m_jobQueueReservation = YATM_DEFAULT_JOB_QUEUE_RESERVATION;						// How many jobs to reserve in the job vector.
 		uint32_t		 m_pendingJobQueueReservation = YATM_DEFAULT_PENDING_JOB_QUEUE_RESERVATION;			// How many jobs to reserve in the pending job vector (jobs waiting to be kicked).
+
+		// How often the heartbeat monitor thread will query the created threads for health information
+		// Setting a value of 0 will disable the heartbeat monitor.
+		uint32_t		 m_heartbeatInterval = 500;
+
+		// How long is the timeout after which a thread will be considered as hung.
+		double			 m_heartbeatTimeout = 2.0;
+
+		// Callback function when the heartbeat monitor detects that one or more threads have been detected as "hung".
+		thread_hang_func m_heartbeatHungCallback;
 	};
 	
 	// -----------------------------------------------------------------------------------------------
@@ -1572,7 +1772,7 @@ namespace yatm
 		struct worker_thread_data
 		{
 			yatm::scheduler*	m_scheduler;
-			uint32_t			m_id;
+			uint32_t			m_index;
 		};
 
 		// -----------------------------------------------------------------------------------------------
@@ -1584,6 +1784,10 @@ namespace yatm
 
 			if (_job != nullptr)
 			{
+				#if YATM_DEBUG_STRINGS
+				YATM_WORKER_SCOPE(_job->m_debugName.c_str());
+				#endif // YATM_DEBUG_STRINGS
+
 				// Recurring jobs do not leave the queue until the worker function says so.
 				bool const is_recurring = (_job->m_flags & job::JF_Recurring) != 0;
 				
@@ -1648,35 +1852,113 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
+		// Entry point for the heartbeat monitor thread, if available.
+		// -----------------------------------------------------------------------------------------------
+#if YATM_HEARTBEAT
+		void heartbeat_entry_point()
+		{
+			YATM_MALLOC_INIT;
+
+			breakpoint_helper bph;
+
+			while (is_running())
+			{
+				// Don't query if the system is paused.
+				if (is_paused())
+					continue;
+
+				auto const nowTicks = time_helpers::now_ticks();
+
+				// Skip on breakpoint hit, but also reset the threads states and their heartbeat ticks.
+				if (bph.detect(get_heartbeat_interval() * 0.001))
+				{
+					for (uint32_t i=0; i<m_numThreads; ++i)
+					{
+						m_threads[i].heartbeat();
+					}
+					continue;
+				}
+
+				std::vector<thread_hang_info> hangs;
+				hangs.reserve(m_numThreads);
+
+				// For each registered thread in the scheduler, we want to query its running time.
+				for (uint32_t i=0; i<m_numThreads; ++i)
+				{
+					auto thread = &m_threads[i];
+
+					// Skip incompatible threads.
+					if (!thread->allow_heartbeat())
+						continue;
+
+					// We only care about legitimate work blocking the thread.
+					if (thread->get_state() != thread_state::working)
+						continue;
+
+					auto const delta = nowTicks - thread->get_heartbeat_ticks();
+
+					// Enough time has passed to consider the thread as hung.
+					if (delta > get_heartbeat_timeout_ticks())
+					{
+						const auto deltaSeconds = time_helpers::ticks_to_seconds(delta);
+						auto str = std::format("Thread {0} ({1}) is hung! Last work update time was {2} seconds ago, working on \"{3}\"\n", thread->get_name(), thread->get_id(), deltaSeconds, thread->get_debug_name());
+						YATM_TTY(str);
+
+						hangs.push_back( { thread, deltaSeconds });
+					}
+				}
+
+				on_hang(std::move(hangs));
+
+				// Wait until the next poll time.
+				sleep(get_heartbeat_interval());
+			}
+
+			YATM_MALLOC_DEINIT;
+
+#if YATM_USE_PTHREADS
+			pthread_exit(nullptr);
+#endif // YATM_USE_PTHREADS
+		}
+#endif // YATM_HEARTBEAT
+
+		// -----------------------------------------------------------------------------------------------
 		// Worker entry point; pulls jobs from the global queue and processes them.
 		// -----------------------------------------------------------------------------------------------
 		void worker_entry_point(uint64_t _index)
 		{
 			YATM_ASSERT(_index < m_queueCount);
 			job_queue& queue = m_queues[_index];
+			thread* thrd = &m_threads[_index];
 
 			YATM_MALLOC_INIT;
 
 			while (queue.is_running())
 			{
 				YATM_WORKER_SCOPE("WorkerEntryFunction");
+
 				job* current_job = nullptr;
-				{					
+				{
 					{
+						// The thread is waiting for jobs.
+						thrd->set_state(thread_state::waiting_for_job);
+
 						// Wait for this thread to be woken up by the condition variable (there must be at least 1 job in the queue, or perhaps we want to simply stop)
 						#if YATM_FUTEX_ATOMICS
-						while(queue.is_paused() || (queue.size() == 0 && queue.is_running()))
+						while(queue.is_paused() || (queue.empty() && queue.is_running()))
 						{
 							queue.wait();
 						}
 
 						#else
 						queue.lock_shared();
-						queue.wait(true, [this, &queue] { return !queue.is_paused() && ((queue.size() > 0u) || !queue.is_running()); });
+						queue.wait(true, [this, &queue] { return !queue.is_paused() && (!queue.empty() || !queue.is_running()); });
 						queue.unlock_shared();
 						#endif // YATM_FUTEX_ATOMICS
 
 						// Try to get a job; if there's no compatible jobs available, look in other queues and try to steal from them.
+						thrd->set_state(thread_state::polling_for_job);
+
 						queue.lock();
 						current_job = get_next_job(_index);
 
@@ -1689,7 +1971,20 @@ namespace yatm
 					}
 				}
 
-				worker_internal(current_job, queue);
+#if YATM_HEARTBEAT
+				thrd->heartbeat(current_job ? current_job->m_debugName : "");
+#endif // YATM_HEARTBEAT
+
+				// Valid job, transition state to "working"
+				if (current_job != nullptr)
+				{
+					thrd->set_state(thread_state::working);
+					worker_internal(current_job, queue);
+				}
+
+#if YATM_HEARTBEAT
+				thrd->heartbeat();
+#endif // YATM_HEARTBEAT
 
 				yield();
 			}
@@ -1765,16 +2060,27 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		void init(const scheduler_desc& _desc)
 		{
-			m_numThreads = std::max(1u, std::min<uint32_t>(_desc.m_numThreads, get_max_threads()));
+			m_numWorkerThreads = m_numThreads = std::max(1u, std::min<uint32_t>(_desc.m_numThreads, get_max_threads()));
+#if YATM_HEARTBEAT
+			if (_desc.m_heartbeatInterval > 0)
+			{
+				using namespace std::chrono;
+				m_heartbeatIndex = m_numWorkerThreads;
+				m_heartbeatInterval = _desc.m_heartbeatInterval;
+				m_heartbeatHangCallback = _desc.m_heartbeatHungCallback;
+				m_heartbeatTimeoutTicks = time_helpers::seconds_to_ticks(_desc.m_heartbeatTimeout);
+				m_numThreads++;
+			}
+#endif // YATM_HEARTBEAT
 
 			m_threadData = new worker_thread_data[m_numThreads];
 			for (uint32_t i = 0; i < m_numThreads; ++i)
 			{
 				m_threadData[i].m_scheduler = this;
-				m_threadData[i].m_id = i;
+				m_threadData[i].m_index = i;
 			}
 
-			m_queueCount = m_numThreads;
+			m_queueCount = m_numWorkerThreads;
 			m_queues = new job_queue[m_queueCount];
 
 			m_stackSizeInBytes = (uint32_t)align(_desc.m_stackSizeInBytes > 0 ? (uint64_t)_desc.m_stackSizeInBytes : YATM_DEFAULT_STACK_SIZE, 16ull);
@@ -1794,28 +2100,39 @@ namespace yatm
 			set_running(true);
 			set_paused(false);
 
-			thread_priority* priorities = (thread_priority*)YATM_ALLOCA(sizeof(thread_priority) * m_numThreads);
+			thread_priority* priorities = (thread_priority*)YATM_ALLOCA(sizeof(thread_priority) * m_numWorkerThreads);
 			if (_desc.m_priorities != nullptr)
 			{
-				memcpy(priorities, _desc.m_priorities, sizeof(thread_priority) * m_numThreads);
+				memcpy(priorities, _desc.m_priorities, sizeof(thread_priority) * m_numWorkerThreads);
 			}
 			else
 			{
-				std::fill(priorities, priorities + m_numThreads, thread_priority::normal);
+				std::fill(priorities, priorities + m_numWorkerThreads, thread_priority::normal);
 			}
 
 			// Create N worker threads and kick them off.
 			// Each worker will process the next available job item from the global queue, resolve its dependencies and carry on until no jobs are left.
-			for (uint32_t i = 0; i < m_numThreads; ++i)
+			for (uint32_t i = 0; i < m_numWorkerThreads; ++i)
 			{
 				auto func = [](void* data) -> void
 				{
-					worker_thread_data* d = reinterpret_cast<worker_thread_data*>(data);
-					d->m_scheduler->worker_entry_point(d->m_id);
+					auto d = static_cast<worker_thread_data*>(data);
+					d->m_scheduler->worker_entry_point(d->m_index);
 				};
 
-				m_threads[i].create(i, m_stackSizeInBytes, func, &m_threadData[i], priorities[i]);
+				m_threads[i].create(i, std::format("Worker {0}", i), m_stackSizeInBytes, true, func, &m_threadData[i], priorities[i]);
 			}
+
+#if YATM_HEARTBEAT
+			if (m_heartbeatInterval > 0)
+			{
+				m_threads[m_heartbeatIndex].create(m_heartbeatIndex, "HeartbeatMonitor", YATM_DEFAULT_STACK_SIZE, false, [](void* data)
+				{
+					auto d = static_cast<worker_thread_data*>(data);
+					d->m_scheduler->heartbeat_entry_point();
+				}, &m_threadData[m_heartbeatIndex], thread_priority::lowest);
+			}
+#endif // YATM_HEARTBEAT
 
 			m_mainThreadId = get_current_thread_id();
 
@@ -1826,7 +2143,7 @@ namespace yatm
 		// Create a new job.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Function>
-		void create_job_manual(job*& _job,  Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
+		void create_job_manual(job*& _job, std::string const& _debugName, Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
 		{
 			_job->m_function = std::forward<Function>(_function);
 			_job->m_data = _data;
@@ -1834,6 +2151,14 @@ namespace yatm
 			_job->m_counter = _counter;
 			_job->m_workerMask = i_workerMask;
 			_job->m_flags = _flags;
+
+#if YATM_DEBUG_STRINGS
+#if YATM_COMPILER_MSVC
+			strcpy_s(_job->m_debugName, _debugName.c_str());
+#else
+			strcpy(_job->m_debugName, _debugName.c_str());
+#endif // YATM_COMPILER_MSVC
+#endif // YATM_DEBUG_STRINGS
 
 			// Initialise the job with 1 pending job (itself).
 			// Adding dependencies increments the pending counter, resolving dependencies decrements it.
@@ -1845,10 +2170,10 @@ namespace yatm
 		// Create a new job.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Function>
-		job* const create_job_manual(Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
+		job* const create_job_manual(std::string const& _debugName, Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
 		{
 			job* j = allocate<job>();
-			create_job_manual(j, std::move(_function), _data, _counter, i_workerMask, _flags);
+			create_job_manual(j, _debugName, std::move(_function), _data, _counter, i_workerMask, _flags);
 			return j;
 		}
 
@@ -1856,9 +2181,9 @@ namespace yatm
 		// Create a job and add it to the pending jobs array.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Function>
-		job* const create_job(Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
+		job* const create_job(std::string const& _debugName, Function&& _function, void* const _data, counter* _counter, uint64_t i_workerMask = ~0ull, job::flags _flags = job::JF_None)
 		{
-			job* const j = create_job_manual(std::move(_function), _data, _counter, i_workerMask, _flags);
+			job* const j = create_job_manual(_debugName, std::move(_function), _data, _counter, i_workerMask, _flags);
 
 			// Register this newly created job; all jobs are automatically added when the scheduler kicks-off the tasks.
 			scoped_lock<mutex> lock(&m_pendingJobsMutex);
@@ -1870,9 +2195,9 @@ namespace yatm
 		// Create a group. A group is simply a job without any work to be done, used as a dependency in other
 		// jobs to create a hierarchy of tasks.
 		// -----------------------------------------------------------------------------------------------
-		job* const create_group(job* const _parent = nullptr)
+		job* const create_group(std::string const& _debugName, job* const _parent = nullptr)
 		{
-			job* const group = create_job(nullptr, nullptr, nullptr);
+			job* const group = create_job(_debugName, nullptr, nullptr, nullptr);
 
 			// If a parent is specified, setup this dependency
 			if (_parent != nullptr)
@@ -1927,12 +2252,12 @@ namespace yatm
 		// Blocks until all are complete.
 		// -----------------------------------------------------------------------------------------------
 		template<typename Iterator, typename Function>
-		void parallel_for(const Iterator& _begin, const Iterator& _end, Function&& _function, uint64_t _workerMask = ~0ull, uint32_t max_jobs = ~0u)
+		void parallel_for(const Iterator& _begin, const Iterator& _end, std::string const& _debugName, Function&& _function, uint64_t _workerMask = ~0ull, uint32_t max_jobs = ~0u)
 		{
 			// At the moment it's only callable from the main thread (also m_pendingExternalJobFree operations are not thread safe).
 			YATM_ASSERT(m_mainThreadId == get_current_thread_id());
 
-			const auto n = std::distance(_begin, _end);
+			auto const n = std::distance(_begin, _end);
 			if (n <= 0) return;
 
 			// When there is only 1 job, don't pass it through the scheduler.
@@ -1959,12 +2284,12 @@ namespace yatm
 					{
 						size_t const start = i * block_size;
 						size_t const end = std::min(start + block_size, static_cast<size_t>(n));
-						if (start >= n)
+						if (start >= static_cast<size_t>(n))
 							continue;
 
 						auto job = &jobs[i];
 
-						create_job_manual(job, [&, start, end](void* const data)
+						create_job_manual(job, _debugName, [&, start, end](void* const data)
 						{
 							for (auto job_index=start; job_index != end; ++job_index)
 							{
@@ -2099,16 +2424,31 @@ namespace yatm
 		uint32_t get_max_threads() const { return m_hwConcurency; }
 
 		// -----------------------------------------------------------------------------------------------
+		// Return the heartbeat timeout in ticks.
+		// -----------------------------------------------------------------------------------------------
+		int64_t get_heartbeat_timeout_ticks() const { return m_heartbeatTimeoutTicks; }
+
+		// -----------------------------------------------------------------------------------------------
+		// Return the interval at which the heartbeat monitor thread queries the threads.
+		// -----------------------------------------------------------------------------------------------
+		uint32_t get_heartbeat_interval() const { return m_heartbeatInterval; }
+
+		// -----------------------------------------------------------------------------------------------
+		// Checks if the heartbeat monitor thread is used.
+		// -----------------------------------------------------------------------------------------------
+		bool has_heartbeat() const { return m_heartbeatIndex > 0; }
+
+		// -----------------------------------------------------------------------------------------------
 		// Check if the scheduler is running worker functions.
 		// -----------------------------------------------------------------------------------------------
-		bool is_running() const { return m_isRunning; }
+		bool is_running() { return atomic::interlocked_compare_exchange(&m_isRunning, 0, 0); }
 
 		// -----------------------------------------------------------------------------------------------
 		// Stop the scheduler from processing, effectively shutting it down.
 		// -----------------------------------------------------------------------------------------------
 		void set_running(bool _running)
 		{
-			m_isRunning = _running;
+			atomic::interlocked_exchange(&m_isRunning, _running);
 			for (uint32_t i = 0; i < m_queueCount; ++i)
 			{
 				m_queues[i].lock();
@@ -2121,14 +2461,14 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Check if the scheduler is paused.
 		// -----------------------------------------------------------------------------------------------
-		bool is_paused() const { return m_isPaused; }
+		bool is_paused() { return atomic::interlocked_compare_exchange(&m_isPaused, 0, 0); }
 
 		// -----------------------------------------------------------------------------------------------
 		// Set the paused status of the scheduler. Worker threads will not process anything until status is resumed.
 		// -----------------------------------------------------------------------------------------------
 		void set_paused(bool _paused)
 		{
-			m_isPaused = _paused;
+			atomic::interlocked_exchange(&m_isPaused, _paused);
 			for (uint32_t i = 0; i < m_queueCount; ++i)
 			{
 				m_queues[i].lock();
@@ -2211,19 +2551,35 @@ namespace yatm
 		mutex* get_pending_jobs_mutex() { return &m_pendingJobsMutex; }
 
 	private:		
-		mutex					m_pendingJobsMutex;
-		uint32_t				m_stackSizeInBytes;
-		uint32_t				m_hwConcurency;
-		uint32_t				m_numThreads;
-		uint32_t				m_queueCount;
-		worker_thread_data*		m_threadData;
-		bool					m_isRunning;
-		bool					m_isPaused;		
-		thread*					m_threads;
-		job_queue*				m_queues;
-		std::vector<job*>		m_pendingJobsToAdd;
-		std::queue<job*>		m_pendingExternalJobFree;
-		uint32_t				m_mainThreadId;
+		mutex						m_pendingJobsMutex;
+		uint32_t					m_stackSizeInBytes;
+		uint32_t					m_hwConcurency;
+		uint32_t					m_numThreads;
+		uint32_t					m_numWorkerThreads;
+		uint32_t					m_heartbeatIndex = 0;
+		uint32_t					m_heartbeatInterval = 0;
+		int64_t						m_heartbeatTimeoutTicks = 0;
+		thread_hang_func			m_heartbeatHangCallback = nullptr;
+		uint32_t					m_queueCount;
+		worker_thread_data*			m_threadData;
+		YATM_ATOMIC_ALIGN int32_t	m_isRunning;
+		YATM_ATOMIC_ALIGN int32_t	m_isPaused;
+		thread*						m_threads;
+		job_queue*					m_queues;
+		std::vector<job*>			m_pendingJobsToAdd;
+		std::queue<job*>			m_pendingExternalJobFree;
+		uint32_t					m_mainThreadId;
+
+		// -----------------------------------------------------------------------------------------------
+		// Called when the heartbeat monitor detects one or more threads to be hung.
+		// -----------------------------------------------------------------------------------------------
+		void on_hang(std::vector<thread_hang_info>&& _hangs) const
+		{
+			if (m_heartbeatHangCallback != nullptr)
+			{
+				m_heartbeatHangCallback(_hangs);
+			}
+		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Get the next queue index in a round-robin way.

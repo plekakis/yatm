@@ -8,6 +8,7 @@ A simple to use threaded task manager, wrapping the native platform API.
 * Parallel-for helper functions
 * Atomic operations on uint32 and uint64 types
 * Manual thread management if needed
+* Hang detection via heartbeat monitor
 
 # Installation
 Simply include the yatm.hpp in your project, while optionally defining before it:
@@ -34,6 +35,7 @@ for (uint32_t i=0; i<10; ++i)
 {
   yatm::job* const test = sch.create_job
   (
+	std::format{"job{0}", i),
     [](void* const _data)
     {
       // ...
@@ -78,6 +80,7 @@ for (uint32_t i=0; i<10; ++i)
 {
   yatm::job* const test = sch.create_job
   (
+	std::format{"job{0}", i),
     [](void* const _data)
     {
       const job_data& data = *((job_data*)_data);
@@ -111,6 +114,7 @@ sch.init(desc);
 // Create a parent task; this will be executed last, after all the children tasks have finished.
 yatm::job* const parent = sch.create_job
 (
+  "parent",
   [](void* const _data)
   {
     // ...
@@ -126,6 +130,7 @@ for (uint32_t i=0; i<10; ++i)
 {
   yatm::job* const test = sch.create_job
   (
+	std::format{"child{0}", i);
     [](void* const _data)
     {
       const job_data& data = *((job_data*)_data);
@@ -160,7 +165,7 @@ desc.m_numThreads = sch.get_max_threads() - 1u;
 sch.init(desc);
 
 // Creates as many tasks as the length of specified data, kicks them and blocks the caller thread until they are finished.
-sch.parallel_for(my_array.begin(), my_array.end(), [](void* const param)
+sch.parallel_for(my_array.begin(), my_array.end(), "my_work", [](void* const param)
 {
   my_struct const& data = *(my_struct*)param;
 

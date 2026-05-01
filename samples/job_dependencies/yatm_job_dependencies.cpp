@@ -69,6 +69,7 @@ void sample_job_dependencies(yatm::scheduler& sch)
 			// Parent task depends on everything else below. This will be executed last.
 			yatm::job* const parent = sch.create_job
 			(
+				"parent",
 				[](void* const data) -> bool
 				{
 					std::cout << "Parent, this should execute after all the groups have finished.\n";
@@ -84,12 +85,12 @@ void sample_job_dependencies(yatm::scheduler& sch)
 
 			// Make a few groups to put the children jobs under. Group0 will depend on children [0, N/2-1] and group1 will depend on children [N/2, N]
 			// Group0_job and group1_job will execute once their respective children have finished executing.
-			yatm::job* const group0 = sch.create_group(parent);
-			yatm::job* const group0_job = sch.create_job([](void* const data) -> bool { std::cout << "Group 0 job, executing after all child 0 are finished.\n"; return true; }, nullptr, &counter);
+			yatm::job* const group0 = sch.create_group("group0", parent);
+			yatm::job* const group0_job = sch.create_job("group0_job", [](void* const data) -> bool { std::cout << "Group 0 job, executing after all child 0 are finished.\n"; return true; }, nullptr, &counter);
 			sch.depend(group0, group0_job);
 
-			yatm::job* const group1 = sch.create_group(parent);
-			yatm::job* const group1_job = sch.create_job([](void* const data) -> bool { std::cout << "Group 1 job, executing after all child 1 are finished.\n"; return true; }, nullptr, &counter);
+			yatm::job* const group1 = sch.create_group("group1", parent);
+			yatm::job* const group1_job = sch.create_job("group1_job", [](void* const data) -> bool { std::cout << "Group 1 job, executing after all child 1 are finished.\n"; return true; }, nullptr, &counter);
 			sch.depend(group1, group1_job);
 
 			// Create child tasks
@@ -98,6 +99,7 @@ void sample_job_dependencies(yatm::scheduler& sch)
 				data[i] = i;
 				yatm::job* const child = sch.create_job
 				(
+					"child_job",
 					[](void* const data) -> bool
 					{
 						uint32_t idx = *(uint32_t*)data;

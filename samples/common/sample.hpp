@@ -41,9 +41,9 @@ namespace yatm
 	static uint64_t work(uint32_t index)
 	{
 		uint64_t result = 0ull;
-		for (uint32_t x = 0; x < 5000; ++x)
+		for (uint32_t x = 0; x < 500; ++x)
 		{
-			for (uint32_t y = 0; y < 5000; ++y)
+			for (uint32_t y = 0; y < 500; ++y)
 			{
 				result += (y ^ (x + 10)) * (y - 1);
 				result = (result << (index % 16));
@@ -60,7 +60,6 @@ namespace yatm
 	{
 		// Initialise the scheduler
 		scheduler_desc desc;
-		memset(&desc, 0, sizeof(desc));
 
 		if (_singleThreaded)
 		{

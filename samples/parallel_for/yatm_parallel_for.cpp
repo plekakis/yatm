@@ -21,8 +21,6 @@
 ** OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 ** SOFTWARE.
 */
-#define YATM_STD_THREAD (0u)
-
 #include "../common/sample.hpp"
 
 // -----------------------------------------------------------------------------------------------
@@ -46,7 +44,7 @@ void sample_parallel_for(yatm::scheduler& sch)
 
 			// Launch them in parallel:
 			// Creates as many tasks as the length of specified data, kicks them and blocks the caller thread until they are finished.
-			sch.parallel_for((uint32_t*)uints, (uint32_t*)uints + dataLength, [](void* const param) -> bool
+			sch.parallel_for((uint32_t*)uints, (uint32_t*)uints + dataLength, "ParallelTest", [&sch](void* const param) -> bool
 			{
 				uint32_t idx = *(uint32_t*)param;
 
@@ -76,8 +74,9 @@ void sample_parallel_for(yatm::scheduler& sch)
 				}
 			}owner;
 
-			sch.parallel_for((uint32_t*)uints, (uint32_t*)uints + dataLength, yatm::bind(&callback::func, &owner));
+			sch.parallel_for((uint32_t*)uints, (uint32_t*)uints + dataLength, "ParallelTest", yatm::bind(&callback::func, &owner));
 			*/
+
 		}
 		sch.sleep(2000);
 	}
