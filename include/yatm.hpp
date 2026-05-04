@@ -571,7 +571,7 @@ namespace yatm
 #if YATM_WIN64_ATOMICS
 			return InterlockedCompareExchange((LONG volatile*)_destination, (LONG)_exchange, (LONG)_comperand);
 #elif YATM_GCC_ATOMICS
-			return __sync_val_compare_and_swap_4(_destination, _compreand, _exchange);
+			return __sync_val_compare_and_swap_4(_destination, _comperand, _exchange);
 #endif
 		}
 
@@ -580,7 +580,7 @@ namespace yatm
 #if YATM_WIN64_ATOMICS
 			return InterlockedCompareExchange64((LONG64 volatile*)_destination, (LONG64)_exchange, (LONG64)_comperand);
 #elif YATM_GCC_ATOMICS
-			return __sync_val_compare_and_swap_8(_destination, _compreand, _exchange);
+			return __sync_val_compare_and_swap_8(_destination, _comperand, _exchange);
 #endif
 		}
 
@@ -589,7 +589,7 @@ namespace yatm
 #if YATM_WIN64_ATOMICS
 			return InterlockedCompareExchangePointer(_destination, _exchange, _comperand);
 #elif YATM_GCC_ATOMICS
-			return (void*)__sync_val_compare_and_swap_8((int64_t*)_destination, (int64_t)_compreand, (int64_t)_exchange);
+			return (void*)__sync_val_compare_and_swap_8((int64_t*)_destination, (int64_t)_comperand, (int64_t)_exchange);
 #endif
 		}
 
@@ -888,9 +888,25 @@ namespace yatm
 			WaitOnAddress(_value, &current, sizeof(current), INFINITE);
 			#elif YATM_PLATFORM_LINUX
 			syscall(SYS_futex,
-					  value,
+					  _value,
 					  FUTEX_WAIT,
 					  current,
+					  nullptr,
+					  nullptr,
+					  0);
+			#endif // YATM_WIN64
+		}
+
+		// -----------------------------------------------------------------------------------------------
+		inline void futex_wait(volatile int32_t* _value, int32_t _expected)
+		{
+			#if YATM_WIN64
+			WaitOnAddress(_value, &_expected, sizeof(_expected), INFINITE);
+			#elif YATM_PLATFORM_LINUX
+			syscall(SYS_futex,
+					  _value,
+					  FUTEX_WAIT,
+					  _expected,
 					  nullptr,
 					  nullptr,
 					  0);
@@ -1003,7 +1019,7 @@ namespace yatm
 			if (this != &other)
 			{
 				m_value = other.m_value;
-				other.m_value = 0;				
+				other.m_value = 0;
 			}
 			return *this;
 		}
@@ -1207,7 +1223,7 @@ namespace yatm
 			T* data = nullptr;
 #if YATM_USE_PTHREADS
 			data = static_cast<T* const>(pthread_getspecific(m_tlsIndex));
-#elif YATM_WIN64			
+#elif YATM_WIN64
 			data = static_cast<T* const>(TlsGetValue(m_tlsIndex));
 #endif // YATM_USE_PTHREADS
 			return data;
@@ -1314,7 +1330,7 @@ namespace yatm
 				break;
 			case thread_priority::below_normal:
 				win32Priority = THREAD_PRIORITY_BELOW_NORMAL;
-				break;			
+				break;
 			case thread_priority::above_normal:
 				win32Priority = THREAD_PRIORITY_ABOVE_NORMAL;
 				break;
@@ -1635,6 +1651,7 @@ namespace yatm
 			YATM_ASSERT(_index < size());
 			job* const j = m_queue[_index];
 			m_queue.erase(m_queue.begin() + _index);
+			atomic::interlocked_decrement(&m_queueSize);
 			return j;
 		}
 
@@ -1649,6 +1666,7 @@ namespace yatm
 			if ( (j->m_workerMask & (1ull << _workerIndex)) != 0)
 			{
 				m_queue.erase(m_queue.begin() + _index);
+				atomic::interlocked_decrement(&m_queueSize);
 				return j;
 			}
 
@@ -1658,7 +1676,7 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Get the job at the specified index, but do not remove it from the queue.
 		// -----------------------------------------------------------------------------------------------
-		job* const peek_job(size_t _index) const
+		job* const peek_job(size_t _index)
 		{
 			YATM_ASSERT(_index < size());
 			return m_queue[_index];
@@ -1670,6 +1688,7 @@ namespace yatm
 		void push_back(job* const _job)
 		{
 			m_queue.push_back(_job);
+			atomic::interlocked_increment(&m_queueSize);
 		}
 
 		// -----------------------------------------------------------------------------------------------
@@ -1714,15 +1733,15 @@ namespace yatm
 		// -----------------------------------------------------------------------------------------------
 		// Get the current size of the queue.
 		// -----------------------------------------------------------------------------------------------
-		size_t size() const
+		int32_t size()
 		{
-			return m_queue.size();
+			return atomic::interlocked_compare_exchange(&m_queueSize, 0, 0);
 		}
 
 		// -----------------------------------------------------------------------------------------------
 		// Check if the queue is empty or not.
 		// -----------------------------------------------------------------------------------------------
-		bool empty() const
+		bool empty()
 		{
 			return size() == 0;
 		}
@@ -1735,6 +1754,17 @@ namespace yatm
 		{
 			helpers::futex_wait(&m_state);
 		}
+
+		void wait(int32_t _expected)
+		{
+			helpers::futex_wait(&m_state, _expected);
+		}
+
+		int32_t snapshot()
+		{
+			return atomic::interlocked_compare_exchange(&m_state, 0, 0);
+		}
+
 		#else
 		// -----------------------------------------------------------------------------------------------
 		// Wait until the condition is fulfilled.
@@ -1747,6 +1777,7 @@ namespace yatm
 		#endif // YATM_FUTEX_ATOMICS
 
 	private:
+		YATM_ATOMIC_ALIGN int32_t m_queueSize = 0;
 		std::vector<job*> m_queue;
 		std::queue<job*>  m_pendingFree;
 		mutex m_mutex;
@@ -1784,10 +1815,6 @@ namespace yatm
 
 			if (_job != nullptr)
 			{
-				#if YATM_DEBUG_STRINGS
-				YATM_WORKER_SCOPE(_job->m_debugName.c_str());
-				#endif // YATM_DEBUG_STRINGS
-
 				// Recurring jobs do not leave the queue until the worker function says so.
 				bool const is_recurring = (_job->m_flags & job::JF_Recurring) != 0;
 				
@@ -1815,7 +1842,7 @@ namespace yatm
 					_queue.lock();
 					_queue.push_back(_job);
 					_queue.notify();
-					_queue.unlock();					
+					_queue.unlock();
 				}
 			}
 
@@ -1835,16 +1862,16 @@ namespace yatm
 			for (auto i = 0; i < queue.size(); ++i)
 			{
 				job* const j = queue.peek_job(i);
-				// Can this job be processed by this worker thread?
-				if (j->m_workerMask & (1ull << _index))
+
+				// This should always be valid at this point; queues only contain compatible jobs - see add_job function
+				YATM_ASSERT(j->m_workerMask & (1ull << _index));
+
+				// This job has 1 remaining task, which means that all its dependencies have been processed.
+				// Pick this task, removing it from the job queue.
+				if (j->m_pendingJobs.is_equal(1u))
 				{
-					// This job has 1 remaining task, which means that all its dependencies have been processed.
-					// Pick this task, removing it from the job queue.
-					if (j->m_pendingJobs.is_equal(1u))
-					{
-						current_job = queue.get_job(i);
-						break;
-					}
+					current_job = queue.get_job(i);
+					break;
 				}
 			}
 
@@ -1863,6 +1890,8 @@ namespace yatm
 
 			while (is_running())
 			{
+				YATM_WORKER_SCOPE("HeartbeatMonitor");
+
 				// Don't query if the system is paused.
 				if (is_paused())
 					continue;
@@ -1947,7 +1976,12 @@ namespace yatm
 						#if YATM_FUTEX_ATOMICS
 						while(queue.is_paused() || (queue.empty() && queue.is_running()))
 						{
-							queue.wait();
+							auto const snapshot = queue.snapshot();
+
+							if (!queue.empty())
+								break;
+
+							queue.wait(snapshot);
 						}
 
 						#else
@@ -2266,7 +2300,7 @@ namespace yatm
 				_function(&(*(_begin)));
 			}
 			// Otherwise split into chunks and spawn M amount of jobs. Pick a block size large enough to schedule the jobs efficiently across the threads and reduce any CPU bubbles.
-			else				
+			else
 			{
 				size_t const max_jobs_actual = std::min(max_jobs, get_max_threads());
 				
@@ -2322,11 +2356,16 @@ namespace yatm
 				auto const zeros = std::countr_zero(_used_mask);
 				queue_index += zeros;
 
+				// Bounds check before indexing
+				if (queue_index >= static_cast<uint32_t>(m_queueCount))
+					break;
+
 				// Notify the queue at the set bit.
 				m_queues[queue_index].notify();
 
 				// Advance mask and queue index.
-				_used_mask >>= (zeros + 1);
+				uint32_t const shift = zeros + 1;
+				_used_mask = (shift >= 64) ? 0 : (_used_mask >> shift);
 				queue_index += 1;
 			}
 		}
@@ -2419,9 +2458,9 @@ namespace yatm
 		}
 
 		// -----------------------------------------------------------------------------------------------
-		// Return the maximum number of worker threads.
+		// Return the maximum number of worker threads. NOTE: This is currently clamped to 64 threads, due to the amount of 64bit bitops required.
 		// -----------------------------------------------------------------------------------------------
-		uint32_t get_max_threads() const { return m_hwConcurency; }
+		uint32_t get_max_threads() const { return std::min(64u, m_hwConcurency); }
 
 		// -----------------------------------------------------------------------------------------------
 		// Return the heartbeat timeout in ticks.
@@ -2518,7 +2557,6 @@ namespace yatm
 			job_queue* selected = nullptr;
 			uint32_t selected_index = 0;
 
-			// First pass: from round-robin start
 			for (uint32_t i = 0; i < m_queueCount; ++i)
 			{
 				selected_index = (start + i) % m_queueCount;
